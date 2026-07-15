@@ -589,7 +589,6 @@ One JSON object per session. All timestamps are ISO-8601 strings with millisecon
 |---|---|---|
 | `index` | integer | 0-based lane index. |
 | `slug` | string | Lane slug per Section 6.3; equals the lane's subfolder name. |
-| `kind` | string | Always `"mix"`. |
 | `processes` | array | Always empty — the lane is a global tap, not a set of resolved target processes. |
 | `calibration` | object \| null | `{deviceUID: string, gainCompensationDB: number, measuredAt: string}` — the Bug-A profile matching the lane's current device, or `null` if none (Section 8). Updated on device switch. Master audio is NEVER modified by this value; it is metadata for meters and export. |
 | `segments` | array | See below. |

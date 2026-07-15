@@ -38,7 +38,6 @@ public final class CaptureLane {
 
     private let engineQueue: DispatchQueue
     private let spec: SessionSpec
-    private let excludeBundleIDs: [String]
     private let bufferFrameSize: UInt32
     private let ownPID: pid_t
 
@@ -92,7 +91,6 @@ public final class CaptureLane {
         slug: String,
         laneDirectory: URL,
         spec: SessionSpec,
-        excludeBundleIDs: [String],
         engineQueue: DispatchQueue,
         bufferFrameSize: UInt32 = 512
     ) {
@@ -100,7 +98,6 @@ public final class CaptureLane {
         self.slug = slug
         self.laneDirectory = laneDirectory
         self.spec = spec
-        self.excludeBundleIDs = excludeBundleIDs
         self.engineQueue = engineQueue
         self.bufferFrameSize = bufferFrameSize
         self.ownPID = ProcessInfo.processInfo.processIdentifier
@@ -118,10 +115,7 @@ public final class CaptureLane {
         timer.schedule(deadline: .now(), repeating: 1.0)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            let audioExpected = ProcessCatalog.isAnyRelevantProcessOutputting(
-                excludingPIDs: [self.ownPID],
-                restrictedToBundleIDs: nil
-            )
+            let audioExpected = ProcessCatalog.isAnyRelevantProcessOutputting(excludingPIDs: [self.ownPID])
             self.corroborationCacheLock.lock()
             self.cachedAudioExpected = audioExpected
             self.cachedCorroborationPolledAt = Date()
@@ -247,7 +241,7 @@ public final class CaptureLane {
         if let ownObjectID = try? ProcessCatalog.translatePIDToProcessObject(ownPID) {
             ids.append(ownObjectID)
         }
-        for bundleID in excludeBundleIDs {
+        for bundleID in spec.excludeBundleIDs {
             if let id = ProcessCatalog.resolveBundleID(bundleID) {
                 ids.append(id)
             }

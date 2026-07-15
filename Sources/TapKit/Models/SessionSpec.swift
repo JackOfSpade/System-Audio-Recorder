@@ -9,18 +9,18 @@ public struct SessionSpec: Sendable {
     /// regardless of this list (Section 3.4).
     public var excludeBundleIDs: [String]
     public var device: DevicePolicy
-    public var tapConfig: TapConfig
+    public var muteBehavior: MuteBehavior
     public var timelinePolicy: TimelinePolicy
 
     public init(
         excludeBundleIDs: [String] = [],
         device: DevicePolicy = .followSystemDefault,
-        tapConfig: TapConfig = TapConfig(),
+        muteBehavior: MuteBehavior = .unmuted,
         timelinePolicy: TimelinePolicy = .preserveWallClock
     ) {
         self.excludeBundleIDs = excludeBundleIDs
         self.device = device
-        self.tapConfig = tapConfig
+        self.muteBehavior = muteBehavior
         self.timelinePolicy = timelinePolicy
     }
 }
@@ -28,14 +28,6 @@ public struct SessionSpec: Sendable {
 public enum DevicePolicy: Sendable {
     case followSystemDefault
     case fixed(deviceUID: String)
-}
-
-public struct TapConfig: Sendable {
-    public var muteBehavior: MuteBehavior
-
-    public init(muteBehavior: MuteBehavior = .unmuted) {
-        self.muteBehavior = muteBehavior
-    }
 }
 
 public enum MuteBehavior: Sendable {

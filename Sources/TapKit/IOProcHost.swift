@@ -44,8 +44,11 @@ public final class IOProcHost {
                     : 0
                 td_context_on_io(ctxPtr, data, byteCount, hostTime, frameCount)
             } else {
-                // Planar (matchDeviceLayout only, Section 5.3): one buffer per
-                // channel plane, concatenated back-to-back by the C side.
+                // Planar: one buffer per channel plane, concatenated
+                // back-to-back by the C side. Not expected in practice — the
+                // tap is always a global stereo mixdown, which reports
+                // interleaved Float32 (Section 5.3) — but handled defensively
+                // in case that assumption is ever wrong on some device/OS.
                 // Uses a stack-allocated fixed buffer (withUnsafeTemporaryAllocation),
                 // NOT a Swift Array — a dynamically-grown Array here would
                 // malloc/free on this real-time thread every callback.

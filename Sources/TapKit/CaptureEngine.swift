@@ -63,9 +63,9 @@ public final class CaptureEngine {
         }
     }
 
-    /// Starts a full session: computes the lane plan, creates the session
-    /// folder + initial manifest, and starts every lane. If any lane fails
-    /// to start, the whole session is torn down and the error surfaced.
+    /// Starts a full session: creates the session folder + initial manifest,
+    /// then starts the single capture lane. If it fails to start, the
+    /// session is torn down and the error surfaced.
     public func start(spec: SessionSpec, namingTemplate: String = "{date} {time} — {source}", completion: @escaping (Result<URL, Error>) -> Void) {
         engineQueue.async { [weak self] in
             guard let self else { return }
@@ -123,7 +123,6 @@ public final class CaptureEngine {
             slug: "mix",
             laneDirectory: laneDir,
             spec: spec,
-            excludeBundleIDs: spec.excludeBundleIDs,
             engineQueue: engineQueue
         )
         let laneDelegate = ManifestUpdatingDelegate(engine: self)
@@ -131,7 +130,7 @@ public final class CaptureEngine {
         lanes = [lane]
         laneDelegates = [laneDelegate]
         let laneEntries = [LaneEntry(
-            index: 0, slug: "mix", kind: "mix",
+            index: 0, slug: "mix",
             processes: [], calibration: nil, segments: [], events: []
         )]
 

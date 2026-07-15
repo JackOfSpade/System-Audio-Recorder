@@ -148,7 +148,7 @@ public enum TapFactory {
 
         description.name = "TapDeck Tap"
         description.isPrivate = true
-        switch spec.tapConfig.muteBehavior {
+        switch spec.muteBehavior {
         case .unmuted:
             description.muteBehavior = .unmuted
         case .mutedWhenTapped:

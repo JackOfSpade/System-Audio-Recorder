@@ -86,15 +86,11 @@ public final class ProcessCatalog {
 
     /// "Is any relevant process currently outputting audio?" (Section 8.1
     /// corroboration signal). `excludingPIDs` covers TapDeck's own PID and
-    /// any system-mix exclusion list; `restrictedToBundleIDs` is always nil
-    /// now that recording is always a global system-mix tap.
-    public static func isAnyRelevantProcessOutputting(excludingPIDs: Set<pid_t>, restrictedToBundleIDs: Set<String>?) -> Bool {
+    /// any system-mix exclusion list.
+    public static func isAnyRelevantProcessOutputting(excludingPIDs: Set<pid_t>) -> Bool {
         guard let processes = try? allProcesses() else { return false }
         for process in processes {
             if excludingPIDs.contains(process.pid) { continue }
-            if let restrictedToBundleIDs {
-                guard let bundleID = process.bundleID, restrictedToBundleIDs.contains(bundleID) else { continue }
-            }
             if process.isRunningOutput { return true }
         }
         return false

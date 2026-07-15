@@ -207,7 +207,6 @@ public struct EventEntry: Codable, Sendable {
 public struct LaneEntry: Codable, Sendable {
     public var index: Int
     public var slug: String
-    public var kind: String  // always "mix"
     public var processes: [ProcessRef]
     public var calibration: CalibrationRef?
     public var segments: [SegmentEntry]
@@ -216,7 +215,6 @@ public struct LaneEntry: Codable, Sendable {
     public init(
         index: Int,
         slug: String,
-        kind: String,
         processes: [ProcessRef],
         calibration: CalibrationRef?,
         segments: [SegmentEntry],
@@ -224,7 +222,6 @@ public struct LaneEntry: Codable, Sendable {
     ) {
         self.index = index
         self.slug = slug
-        self.kind = kind
         self.processes = processes
         self.calibration = calibration
         self.segments = segments
