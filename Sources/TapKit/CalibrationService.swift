@@ -2,7 +2,7 @@ import AVFoundation
 import Accelerate
 import CoreAudio
 import Darwin
-import TapDeckRT
+import SystemAudioRecorderRT
 import Foundation
 
 public struct CalibrationProfile: Codable, Sendable {
@@ -38,11 +38,11 @@ public enum CalibrationService {
     private static let measurementWindowEndSeconds: Double = 4   // skip last 1s
 
     /// Profiles persist as shared JSON at `~/Library/Application Support/
-    /// TapDeck/calibration.json` (Section 8.3), read/written by both the GUI
-    /// and the CLI (separate processes, no IPC), written atomically.
+    /// System Audio Recorder/calibration.json` (Section 8.3), read/written by
+    /// both the GUI and the CLI (separate processes, no IPC), written atomically.
     public static var profileStoreURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return appSupport.appendingPathComponent("TapDeck").appendingPathComponent("calibration.json")
+        return appSupport.appendingPathComponent("System Audio Recorder").appendingPathComponent("calibration.json")
     }
 
     public static func loadProfiles() -> [CalibrationProfile] {
@@ -210,7 +210,7 @@ public enum CalibrationService {
             mBytesPerPacket: 8, mFramesPerPacket: 1, mBytesPerFrame: 8,
             mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0
         )
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("tapdeck_calibration_tone_\(UUID().uuidString).aiff")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("systemaudiorecorder_calibration_tone_\(UUID().uuidString).aiff")
         var file: ExtAudioFileRef?
         guard ExtAudioFileCreateWithURL(url as CFURL, kAudioFileAIFFType, &asbd, nil, AudioFileFlags.eraseFile.rawValue, &file) == noErr,
               let f = file else {

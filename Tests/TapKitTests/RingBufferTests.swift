@@ -1,7 +1,7 @@
 import XCTest
-import TapDeckRT
+import SystemAudioRecorderRT
 
-/// Swift-side coverage of the `TapDeckRT` C ring buffer, complementing the
+/// Swift-side coverage of the `SystemAudioRecorderRT` C ring buffer, complementing the
 /// pure-C smoke test in Tests/CRingTests (which exercises the same API
 /// without the Swift/C interop layer in between).
 final class RingBufferTests: XCTestCase {

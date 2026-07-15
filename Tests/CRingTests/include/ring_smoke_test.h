@@ -1,5 +1,5 @@
 /*
- * ring_smoke_test.h — pure-C smoke test for TapDeckRT's ring buffer,
+ * ring_smoke_test.h — pure-C smoke test for SystemAudioRecorderRT's ring buffer,
  * exercised directly (no Swift/C interop layer in between) as a
  * cross-check against Tests/TapKitTests/RingBufferTests.swift, which
  * covers the same cases through Swift.

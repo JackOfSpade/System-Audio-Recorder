@@ -72,7 +72,7 @@ func recordingsRoot(from parser: ArgParser) -> URL {
     if let out = parser.value("--out") {
         return URL(fileURLWithPath: out)
     }
-    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/TapDeck")
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/System Audio Recorder")
 }
 
 // MARK: record
@@ -156,7 +156,7 @@ func runRecord(_ parser: ArgParser) -> Never {
     // would ever drain the main dispatch queue and this handler would never
     // fire. A dedicated background queue is serviced by the libdispatch
     // thread pool regardless of what the main thread is doing.
-    let signalQueue = DispatchQueue(label: "com.tapdeck.cli.signal")
+    let signalQueue = DispatchQueue(label: "com.systemaudiorecorder.cli.signal")
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
     sigintSource.setEventHandler {
         stderrLine("[\(ManifestTimestamp.now())] Ctrl-C received, finalizing…")
@@ -314,7 +314,7 @@ func runSessions(_ parser: ArgParser) -> Never {
 
 func runExport(_ args: [String]) -> Never {
     guard args.count >= 1 else {
-        fail(.usage, "usage: tapdeck export <session-path> --format flac16|flac24|alac16|alac24|aac|wav24 [--compensate-gain on|off] [--out <dir>]")
+        fail(.usage, "usage: systemaudiorecorder export <session-path> --format flac16|flac24|alac16|alac24|aac|wav24 [--compensate-gain on|off] [--out <dir>]")
     }
     let sessionPath = args[0]
     let parser = ArgParser(Array(args.dropFirst()))
@@ -388,13 +388,13 @@ func runCalibrate(_ parser: ArgParser) -> Never {
         fail(.notFound, "Could not resolve device UID/name")
     }
 
-    print("TapDeck will play a 5-second test tone through \(name). Continue? [y/N]", terminator: " ")
+    print("System Audio Recorder will play a 5-second test tone through \(name). Continue? [y/N]", terminator: " ")
     guard let answer = readLine(), answer.lowercased() == "y" else {
         print("Cancelled.")
         exit(ExitCode.ok.rawValue)
     }
 
-    let engineQueue = DispatchQueue(label: "com.tapdeck.cli.calibration")
+    let engineQueue = DispatchQueue(label: "com.systemaudiorecorder.cli.calibration")
     let semaphore = DispatchSemaphore(value: 0)
     var finalResult: Result<CalibrationProfile, Error>?
     CalibrationService.runCalibration(deviceUID: uid, engineQueue: engineQueue) { result in
@@ -418,7 +418,7 @@ func runCalibrate(_ parser: ArgParser) -> Never {
 
 let allArgs = Array(CommandLine.arguments.dropFirst())
 guard let verb = allArgs.first else {
-    fail(.usage, "usage: tapdeck <record|devices|apps|sessions|export|calibrate> [options]")
+    fail(.usage, "usage: systemaudiorecorder <record|devices|apps|sessions|export|calibrate> [options]")
 }
 let rest = Array(allArgs.dropFirst())
 let parser = ArgParser(rest)
@@ -431,5 +431,5 @@ case "sessions": runSessions(parser)
 case "export": runExport(rest)
 case "calibrate": runCalibrate(parser)
 default:
-    fail(.usage, "Unknown verb '\(verb)'. usage: tapdeck <record|devices|apps|sessions|export|calibrate> [options]")
+    fail(.usage, "Unknown verb '\(verb)'. usage: systemaudiorecorder <record|devices|apps|sessions|export|calibrate> [options]")
 }

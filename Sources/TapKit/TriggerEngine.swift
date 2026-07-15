@@ -35,10 +35,10 @@ public enum HookRunner {
             process.arguments = ["-c", command]
 
             var env = ProcessInfo.processInfo.environment
-            env["TAPDECK_SESSION_PATH"] = sessionPath
-            env["TAPDECK_EVENT"] = event.rawValue
+            env["SYSTEMAUDIORECORDER_SESSION_PATH"] = sessionPath
+            env["SYSTEMAUDIORECORDER_EVENT"] = event.rawValue
             if let segmentPath {
-                env["TAPDECK_SEGMENT_PATH"] = segmentPath
+                env["SYSTEMAUDIORECORDER_SEGMENT_PATH"] = segmentPath
             }
             process.environment = env
 
@@ -70,7 +70,7 @@ public enum HookRunner {
             } catch {
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
-                FileHandle.standardError.write("TapDeck: hook \(event.rawValue) failed to launch: \(error)\n".data(using: .utf8)!)
+                FileHandle.standardError.write("System Audio Recorder: hook \(event.rawValue) failed to launch: \(error)\n".data(using: .utf8)!)
                 return
             }
 
@@ -80,7 +80,7 @@ public enum HookRunner {
             }
             if process.isRunning {
                 process.terminate()
-                FileHandle.standardError.write("TapDeck: hook \(event.rawValue) timed out after \(Int(timeoutSeconds))s; killed.\n".data(using: .utf8)!)
+                FileHandle.standardError.write("System Audio Recorder: hook \(event.rawValue) timed out after \(Int(timeoutSeconds))s; killed.\n".data(using: .utf8)!)
             }
 
             outPipe.fileHandleForReading.readabilityHandler = nil
@@ -99,10 +99,10 @@ public enum HookRunner {
             drainNonBlocking(errPipe.fileHandleForReading, into: errBuffer)
 
             if let out = String(data: outBuffer.data, encoding: .utf8), !out.isEmpty {
-                FileHandle.standardError.write("TapDeck: hook \(event.rawValue) stdout: \(out)\n".data(using: .utf8)!)
+                FileHandle.standardError.write("System Audio Recorder: hook \(event.rawValue) stdout: \(out)\n".data(using: .utf8)!)
             }
             if let err = String(data: errBuffer.data, encoding: .utf8), !err.isEmpty {
-                FileHandle.standardError.write("TapDeck: hook \(event.rawValue) stderr: \(err)\n".data(using: .utf8)!)
+                FileHandle.standardError.write("System Audio Recorder: hook \(event.rawValue) stderr: \(err)\n".data(using: .utf8)!)
             }
         }
     }
@@ -212,7 +212,7 @@ public protocol TriggerEngineDelegate: AnyObject {
 public final class TriggerEngine {
     public weak var delegate: TriggerEngineDelegate?
     private let processCatalog: ProcessCatalog
-    private let queue = DispatchQueue(label: "com.tapdeck.triggerengine")
+    private let queue = DispatchQueue(label: "com.systemaudiorecorder.triggerengine")
 
     private var scheduleRules: [ScheduleRule] = []
     private var scheduleTimer: DispatchSourceTimer?

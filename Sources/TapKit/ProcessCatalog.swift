@@ -85,7 +85,7 @@ public final class ProcessCatalog {
     }
 
     /// "Is any relevant process currently outputting audio?" (Section 8.1
-    /// corroboration signal). `excludingPIDs` covers TapDeck's own PID and
+    /// corroboration signal). `excludingPIDs` covers System Audio Recorder's own PID and
     /// any system-mix exclusion list.
     public static func isAnyRelevantProcessOutputting(excludingPIDs: Set<pid_t>) -> Bool {
         guard let processes = try? allProcesses() else { return false }

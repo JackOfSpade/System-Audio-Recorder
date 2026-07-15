@@ -63,7 +63,7 @@ public enum TapFactory {
             // Section 7.2: mismatch is logged, never fatal — the tap format
             // is trusted over the device property.
             FileHandle.standardError.write(
-                "TapDeck: tap format rate \(tapFormat.mSampleRate) != device nominal rate \(nominalRate); trusting tap format.\n".data(using: .utf8)!
+                "System Audio Recorder: tap format rate \(tapFormat.mSampleRate) != device nominal rate \(nominalRate); trusting tap format.\n".data(using: .utf8)!
             )
         }
 
@@ -71,7 +71,7 @@ public enum TapFactory {
         // these keys (Section 4.5 step 4), then create it.
         let aggregateUID = UUID().uuidString
         let compositionDict: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "TapDeck Capture \(laneSlug)",
+            kAudioAggregateDeviceNameKey: "System Audio Recorder Capture \(laneSlug)",
             kAudioAggregateDeviceUIDKey: aggregateUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
@@ -124,19 +124,19 @@ public enum TapFactory {
         let aggStatus = AudioHardwareDestroyAggregateDevice(handle.aggregateID)
         if aggStatus != noErr {
             FileHandle.standardError.write(
-                "TapDeck: AudioHardwareDestroyAggregateDevice returned \(aggStatus); continuing teardown.\n".data(using: .utf8)!
+                "System Audio Recorder: AudioHardwareDestroyAggregateDevice returned \(aggStatus); continuing teardown.\n".data(using: .utf8)!
             )
         }
         let tapStatus = AudioHardwareDestroyProcessTap(handle.tapID)
         if tapStatus != noErr {
             FileHandle.standardError.write(
-                "TapDeck: AudioHardwareDestroyProcessTap returned \(tapStatus); continuing teardown.\n".data(using: .utf8)!
+                "System Audio Recorder: AudioHardwareDestroyProcessTap returned \(tapStatus); continuing teardown.\n".data(using: .utf8)!
             )
         }
     }
 
     /// Section 4.5 step 2 — always a global stereo tap of everything the Mac
-    /// plays, minus `excludeProcessIDs` (which always includes TapDeck's own
+    /// plays, minus `excludeProcessIDs` (which always includes System Audio Recorder's own
     /// PID, appended by `CaptureLane`), using `CATapDescription`'s
     /// `stereoGlobalTapButExcludeProcesses:` initializer (verified against
     /// the CoreAudio SDK headers directly, not assumed).
@@ -146,7 +146,7 @@ public enum TapFactory {
     ) -> CATapDescription {
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeProcessIDs)
 
-        description.name = "TapDeck Tap"
+        description.name = "System Audio Recorder Tap"
         description.isPrivate = true
         switch spec.muteBehavior {
         case .unmuted:

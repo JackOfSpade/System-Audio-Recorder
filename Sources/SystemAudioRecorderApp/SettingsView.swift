@@ -5,7 +5,7 @@ import TapKit
 /// & Export, Automation, Advanced.
 struct SettingsView: View {
     @ObservedObject var appState: AppState
-    @AppStorage("recordingsFolder") private var recordingsFolder: String = "~/Music/TapDeck/"
+    @AppStorage("recordingsFolder") private var recordingsFolder: String = "~/Music/System Audio Recorder/"
     @AppStorage("namingTemplate") private var namingTemplate: String = "{date} {time} — {source}"
     @AppStorage("showDockIcon") private var showDockIcon: Bool = false
     @AppStorage("timelinePolicy") private var timelinePolicy: String = TimelinePolicy.preserveWallClock.rawValue
@@ -72,7 +72,7 @@ struct SettingsView: View {
             }
             Toggle("Force capture rate", isOn: $forcedRateEnabled)
             if forcedRateEnabled {
-                Text("Forcing a rate different from the output device's current rate makes macOS resample the audio before TapDeck can capture it. Only use this if you need a fixed rate more than you need maximum fidelity.")
+                Text("Forcing a rate different from the output device's current rate makes macOS resample the audio before System Audio Recorder can capture it. Only use this if you need a fixed rate more than you need maximum fidelity.")
                     .font(.caption).foregroundStyle(.red)
             }
             Button("Run Calibration…") {

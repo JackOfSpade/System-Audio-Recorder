@@ -1,23 +1,23 @@
-# TapDeck — Design Document
+# System Audio Recorder — Design Document
 ### A native macOS system-audio recorder built on the Core Audio Process Tap (near-bit-perfect capture)
 
-**Document status:** Complete architecture/design specification. No implementation code is included; this document is the sole context an implementer needs. "TapDeck" is a working title and is trivially renameable (bundle identifiers `com.tapdeck.app` / `com.tapdeck.cli` are placeholders to be replaced with the owner's organization identifier).
+**Document status:** Complete architecture/design specification. No implementation code is included; this document is the sole context an implementer needs. "System Audio Recorder" is a working title and is trivially renameable (bundle identifiers `com.systemaudiorecorder.app` / `com.systemaudiorecorder.cli` are placeholders to be replaced with the owner's organization identifier).
 
 ---
 
 ## 1. Executive Summary
 
-TapDeck is a fully-owned, deeply customizable native macOS application that records what the Mac plays — the entire system mix, minus any apps you choose to exclude — at the highest fidelity macOS makes available to any third-party application. It is a menu-bar-first GUI app with a full sessions Library and Settings, paired with a standalone `tapdeck` command-line tool for headless and scripted use. Minimum deployment target is macOS 14.4; distribution is Developer ID–signed, notarized, hardened-runtime, **unsandboxed**, outside the Mac App Store.
+System Audio Recorder is a fully-owned, deeply customizable native macOS application that records what the Mac plays — the entire system mix, minus any apps you choose to exclude — at the highest fidelity macOS makes available to any third-party application. It is a menu-bar-first GUI app with a full sessions Library and Settings, paired with a standalone `systemaudiorecorder` command-line tool for headless and scripted use. Minimum deployment target is macOS 14.4; distribution is Developer ID–signed, notarized, hardened-runtime, **unsandboxed**, outside the Mac App Store.
 
 **Core architecture.** Capture uses Apple's Core Audio **Process Tap** API: a `CATapDescription` (global, with exclusions) is instantiated with `AudioHardwareCreateProcessTap`, wrapped as a sub-tap inside a **private aggregate device** whose main sub-device is the real output device, and read with a **raw IOProc** registered via `AudioDeviceCreateIOProcIDWithBlock`. This delivers Core Audio's internal 32-bit float mix without installing a driver, without touching the user's audio routing, and without the Screen Recording–shaped compromises of ScreenCaptureKit. AVAudioEngine is explicitly banned from the capture path: it cannot be retargeted to a tap-backed aggregate device (the retarget silently no-ops and reads the default input instead) — a documented trap this design avoids by construction. Virtual-driver approaches (HAL plugin / AudioDriverKit) were evaluated and rejected: they add install friction, reroute the user's audio, introduce drift correction, and deliver **no fidelity advantage** over the tap.
 
-**The fidelity target — stated honestly.** macOS applies a non-optional ingestion-side reconstruction filter to all Process Tap captures; on synthetic broadband signals (a 200 Hz square wave) this leaves a measurable Gibbs-ringing residual (≈ −2.9 dBFS RMS in null tests), so capture is *not* mathematically sample-identical. For real content it is perceptually and practically lossless, and — critically — this ceiling is imposed by the OS on every driverless third-party capture tool, including the leading commercial ones. TapDeck's design goal is therefore **near-bit-perfect**: add *zero* degradation of its own. Concretely: capture at the output device's actual current nominal sample rate (never assumed, never converted), keep samples in 32-bit float end-to-end, apply no gain, dither, or resampling in the master path, and write masters as Float32 **CAF** — never WAV, which has a known Core Audio bug that silently truncates float to Int32. The validation plan (Section 10) includes a full null-test methodology to prove, and continuously re-prove, that TapDeck sits exactly at the OS ceiling.
+**The fidelity target — stated honestly.** macOS applies a non-optional ingestion-side reconstruction filter to all Process Tap captures; on synthetic broadband signals (a 200 Hz square wave) this leaves a measurable Gibbs-ringing residual (≈ −2.9 dBFS RMS in null tests), so capture is *not* mathematically sample-identical. For real content it is perceptually and practically lossless, and — critically — this ceiling is imposed by the OS on every driverless third-party capture tool, including the leading commercial ones. System Audio Recorder's design goal is therefore **near-bit-perfect**: add *zero* degradation of its own. Concretely: capture at the output device's actual current nominal sample rate (never assumed, never converted), keep samples in 32-bit float end-to-end, apply no gain, dither, or resampling in the master path, and write masters as Float32 **CAF** — never WAV, which has a known Core Audio bug that silently truncates float to Int32. The validation plan (Section 10) includes a full null-test methodology to prove, and continuously re-prove, that System Audio Recorder sits exactly at the OS ceiling.
 
-**Defensive engineering.** Two known macOS bugs shape the design. First, an intermittent failure mode in which the tap keeps delivering validly-timestamped buffers of exact zeros while audio audibly plays: TapDeck runs a **ZeroWatchdog** that distinguishes this from genuine silence by corroborating sustained exact-zero runs against an independent "is any process actually emitting audio?" signal (`kAudioProcessPropertyIsRunningOutput`), and recovers with the only known-reliable fix — a full, strictly-ordered teardown and rebuild of the IOProc, aggregate device, and tap — while keeping the recording file open so sessions survive recovery (Section 8). Second, a level-attenuation bug on multi-output-channel devices (level scales roughly as 20·log₁₀ of the output stereo-pair count — ~12 dB measured on a 4-pair interface): TapDeck detects at-risk devices, offers a one-shot calibration that measures the actual offset, stores it as metadata, and applies compensation on export — never silently altering the master (Section 8).
+**Defensive engineering.** Two known macOS bugs shape the design. First, an intermittent failure mode in which the tap keeps delivering validly-timestamped buffers of exact zeros while audio audibly plays: System Audio Recorder runs a **ZeroWatchdog** that distinguishes this from genuine silence by corroborating sustained exact-zero runs against an independent "is any process actually emitting audio?" signal (`kAudioProcessPropertyIsRunningOutput`), and recovers with the only known-reliable fix — a full, strictly-ordered teardown and rebuild of the IOProc, aggregate device, and tap — while keeping the recording file open so sessions survive recovery (Section 8). Second, a level-attenuation bug on multi-output-channel devices (level scales roughly as 20·log₁₀ of the output stereo-pair count — ~12 dB measured on a 4-pair interface): System Audio Recorder detects at-risk devices, offers a one-shot calibration that measures the actual offset, stores it as metadata, and applies compensation on export — never silently altering the master (Section 8).
 
 **Product shape and customizability.** The feature set is deliberately coherent rather than maximal: global system-mix recording with an app exclusion list; automatic session segmentation across device switches and sample-rate changes with a machine-readable `session.json` manifest; a lossless-first export pipeline (FLAC, ALAC, AAC, and compatibility WAV derived from the CAF master); live metering with capture-health status; and a full automation surface — CLI, URL scheme, Shortcuts (App Intents), shell hooks on session events, scheduled recordings, and "record while app X is playing" triggers. Excluded from v1, on purpose: live monitoring/routing (system audio is already audible), any sample-rate conversion anywhere, loudness normalization, and Mac App Store distribution (the tap API is unreliable under App Sandbox).
 
-**Implementation stack.** Swift throughout, with one small C target (`TapDeckRT`) for the real-time path: the IOProc callback only calls C ring-buffer functions, so the Swift runtime (ARC, exclusivity checks, allocation) can never stall the HAL real-time thread. A shared framework (`TapKit`) contains all capture, device, watchdog, file, and export logic and is consumed by both the GUI app and the CLI. The build proceeds in ten validated phases (Section 12), starting with a end-to-end spike (global tap → CAF file) that proves permissions, tap plumbing, and file integrity before any product code is written.
+**Implementation stack.** Swift throughout, with one small C target (`SystemAudioRecorderRT`) for the real-time path: the IOProc callback only calls C ring-buffer functions, so the Swift runtime (ARC, exclusivity checks, allocation) can never stall the HAL real-time thread. A shared framework (`TapKit`) contains all capture, device, watchdog, file, and export logic and is consumed by both the GUI app and the CLI. The build proceeds in ten validated phases (Section 12), starting with a end-to-end spike (global tap → CAF file) that proves permissions, tap plumbing, and file integrity before any product code is written.
 
 ---
 
@@ -25,7 +25,7 @@ TapDeck is a fully-owned, deeply customizable native macOS application that reco
 
 ### 2.1 Languages: Swift 5.10+, plus one small C target
 
-Everything in TapDeck is **Swift 5.10 or later**, with a single deliberate exception: the real-time capture path is a **C11 static library, `TapDeckRT`** (see Section 4 for the target layout and Section 5 for the data flow through it).
+Everything in System Audio Recorder is **Swift 5.10 or later**, with a single deliberate exception: the real-time capture path is a **C11 static library, `SystemAudioRecorderRT`** (see Section 4 for the target layout and Section 5 for the data flow through it).
 
 The reason for the C island is the HAL real-time thread. The IOProc callback registered with `AudioDeviceCreateIOProcIDWithBlock` (with a `NULL` dispatch queue) runs directly on Core Audio's real-time I/O thread. Code on that thread must never block, never allocate, and never take a lock — a missed deadline means dropped capture buffers, an unrecoverable gap in the recording (and an I/O overload the HAL reports against our process). Swift cannot guarantee any of that:
 
@@ -33,7 +33,7 @@ The reason for the C island is the HAL real-time thread. The IOProc callback reg
 - **Exclusivity enforcement**: Swift's runtime exclusivity checks can trap or take slow paths at unpredictable points.
 - **Hidden allocation**: string interpolation, collection copy-on-write, existential boxing, and closure context capture can all heap-allocate invisibly.
 
-C11 has none of these hazards and gives us exactly the two primitives the real-time path needs: `memcpy` into preallocated memory, and C11 atomics with explicit acquire/release ordering for the single-producer/single-consumer ring buffer (`td_ring_t`, fully specified in Section 5). The IOProc block itself is trivially small: it captures **only an unmanaged raw pointer** to a preallocated C context struct and calls `TapDeckRT` C functions — no Swift objects, no ObjC messaging, no logging, no syscalls. Everything else in the product (device management, watchdogs, file writing, export, UI) has no real-time constraint and stays in Swift where it is faster to write correctly.
+C11 has none of these hazards and gives us exactly the two primitives the real-time path needs: `memcpy` into preallocated memory, and C11 atomics with explicit acquire/release ordering for the single-producer/single-consumer ring buffer (`td_ring_t`, fully specified in Section 5). The IOProc block itself is trivially small: it captures **only an unmanaged raw pointer** to a preallocated C context struct and calls `SystemAudioRecorderRT` C functions — no Swift objects, no ObjC messaging, no logging, no syscalls. Everything else in the product (device management, watchdogs, file writing, export, UI) has no real-time constraint and stays in Swift where it is faster to write correctly.
 
 ### 2.2 Frameworks (exact list — nothing else)
 
@@ -62,7 +62,7 @@ Also explicitly forbidden anywhere in the master path (rationale in Sections 5 a
 
 ### 2.4 Why no third-party dependencies
 
-Core TapDeck has **zero third-party dependencies**. Reasons, in order of weight:
+Core System Audio Recorder has **zero third-party dependencies**. Reasons, in order of weight:
 
 1. **The Core Audio C API *is* the product surface.** The design depends on exact property constants, exact call ordering, and exact teardown sequences (Sections 4 and 8). Wrapper libraries hide precisely the details that Bug A and Bug B force us to control.
 2. **Real-time auditability.** Every instruction that can run on the HAL thread must be inspectable; a dependency in that path would be unauditable risk.
@@ -73,7 +73,7 @@ The single sanctioned exception: **Sparkle 2** for auto-updates, optional, GUI-o
 
 ### 2.5 Why AppKit lifecycle with SwiftUI views
 
-TapDeck is a **menu-bar-first** app (`NSStatusItem`, `LSUIElement = YES`, with a user setting to show a Dock icon). That shape needs AppKit-level control that the pure SwiftUI `App`/`MenuBarExtra` lifecycle does not reliably provide on macOS 14.4:
+System Audio Recorder is a **menu-bar-first** app (`NSStatusItem`, `LSUIElement = YES`, with a user setting to show a Dock icon). That shape needs AppKit-level control that the pure SwiftUI `App`/`MenuBarExtra` lifecycle does not reliably provide on macOS 14.4:
 
 - Precise `NSStatusItem` control (custom click handling, programmatic popover/menu behavior, status-icon state changes for the health chip).
 - Runtime activation-policy switching for the Dock-icon toggle (`.accessory` ↔ `.regular`).
@@ -84,7 +84,7 @@ So: an **AppDelegate owns the status item and the two windows; each window hosts
 
 ### 2.6 Project layout
 
-A **single Xcode project** with the four targets of Section 4.1 (`TapDeckRT` C static library, `TapKit` Swift framework built for static linkage, `TapDeckApp` app, `tapdeck` command-line tool). No SwiftPM manifest is required in v1; nothing about the design precludes migrating `TapDeckRT`/`TapKit` to local Swift packages later.
+A **single Xcode project** with the four targets of Section 4.1 (`SystemAudioRecorderRT` C static library, `TapKit` Swift framework built for static linkage, `SystemAudioRecorderApp` app, `systemaudiorecorder` command-line tool). No SwiftPM manifest is required in v1; nothing about the design precludes migrating `SystemAudioRecorderRT`/`TapKit` to local Swift packages later.
 
 ---
 
@@ -92,16 +92,16 @@ A **single Xcode project** with the four targets of Section 4.1 (`TapDeckRT` C s
 
 ### 3.1 Product shape
 
-TapDeck ships as two executables built on one shared framework (`TapKit`, see Section 4):
+System Audio Recorder ships as two executables built on one shared framework (`TapKit`, see Section 4):
 
-1. **Menu-bar-first GUI app** (`com.tapdeck.app`). An `NSStatusItem` app with `LSUIElement = YES` (no Dock icon by default; a General-settings toggle shows one). It has exactly two windows — **Library** (session browser + export) and **Settings** — both SwiftUI views hosted in an AppKit lifecycle: the AppDelegate owns the status item and the windows, each window hosting a SwiftUI root view.
-2. **Standalone CLI `tapdeck`** (`com.tapdeck.cli`, embedded Info.plist via the `__info_plist` linker section). Fully headless; it instantiates the same `CaptureEngine` the GUI uses.
+1. **Menu-bar-first GUI app** (`com.systemaudiorecorder.app`). An `NSStatusItem` app with `LSUIElement = YES` (no Dock icon by default; a General-settings toggle shows one). It has exactly two windows — **Library** (session browser + export) and **Settings** — both SwiftUI views hosted in an AppKit lifecycle: the AppDelegate owns the status item and the windows, each window hosting a SwiftUI root view.
+2. **Standalone CLI `systemaudiorecorder`** (`com.systemaudiorecorder.cli`, embedded Info.plist via the `__info_plist` linker section). Fully headless; it instantiates the same `CaptureEngine` the GUI uses.
 
 The two binaries do **not** talk to each other — no XPC or IPC in v1. Consequence the implementer must surface in docs and onboarding: macOS grants system-audio-capture permission per bundle id, so a user who uses both the app and the CLI will see **two separate TCC prompts** (one per binary). This is an accepted v1 trade-off for simplicity (see Section 9 for the permission flow).
 
 ### 3.2 Feature set — what is IN v1
 
-One honesty note frames everything in this table: TapDeck targets "near-bit-perfect", not bit-perfect — macOS applies a non-optional reconstruction filter to all Process Tap captures, measurable on synthetic signals but perceptually lossless on real content, and every driverless third-party recorder (including commercial tools) sits at this same OS-imposed ceiling. TapDeck's job is to add zero degradation of its own (Section 1, Section 10).
+One honesty note frames everything in this table: System Audio Recorder targets "near-bit-perfect", not bit-perfect — macOS applies a non-optional reconstruction filter to all Process Tap captures, measurable on synthetic signals but perceptually lossless on real content, and every driverless third-party recorder (including commercial tools) sits at this same OS-imposed ceiling. System Audio Recorder's job is to add zero degradation of its own (Section 1, Section 10).
 
 | Feature | Summary | Why it's in |
 |---|---|---|
@@ -121,10 +121,10 @@ Each exclusion is a decision, not an omission. The implementer must not add thes
 
 - **No live monitoring / passthrough.** The tap's default `muteBehavior` is `.unmuted`, so the user already hears the audio through the normal output path; a monitor path would add a second output route, latency management, and a strong temptation to reach for AVAudioEngine — which is banned from the capture path (Section 2).
 - **No loudness normalization, EQ, effects, or any DSP.** The master is raw by definition. Gain compensation exists only as export-time scalar multiply plus metadata (Section 8); everything else is out.
-- **No sample-rate conversion in any TapDeck code path.** Capture is at the tapped device's native nominal rate and exports keep the master's rate. SRC would silently break the "near-bit-perfect" claim. The one deliberate exception is the default-off advanced **Forced-rate mode** (3.6.3, Section 7), which does not resample in TapDeck either — it delegates resampling to macOS and therefore carries a verbatim fidelity warning.
+- **No sample-rate conversion in any System Audio Recorder code path.** Capture is at the tapped device's native nominal rate and exports keep the master's rate. SRC would silently break the "near-bit-perfect" claim. The one deliberate exception is the default-off advanced **Forced-rate mode** (3.6.3, Section 7), which does not resample in System Audio Recorder either — it delegates resampling to macOS and therefore carries a verbatim fidelity warning.
 - **No pre-roll on triggers.** App-activity triggers can miss up to ~1 s of lead-in (see 3.12). Pre-roll would require a permanently running tap (constant CPU, a permanently "in use" capture grant, and privacy optics). Documented limitation instead.
 - **No audio editing** (trim/split/join) in Library. Export-only in v1.
-- **No microphone/input capture.** TapDeck records what the Mac *plays*, only.
+- **No microphone/input capture.** System Audio Recorder records what the Mac *plays*, only.
 - **No streaming/broadcast output, no cloud sync.**
 - **No Mac App Store build** — the Process Tap API is unreliable under App Sandbox (Section 9).
 - **No GUI↔CLI IPC** (see 3.1).
@@ -133,7 +133,7 @@ Each exclusion is a decision, not an omission. The implementer must not add thes
 
 A recording is fully described by a `SessionSpec` (consumed by `CaptureEngine`, Section 4). Recording is always a single global tap built with `CATapDescription(stereoGlobalTapButExcludeProcesses:)`, configured by:
 
-- **`excludeBundleIDs: [String]`** — bundle ids excluded from the tap. The exclusion list ALWAYS contains TapDeck's own PID (prevents feedback if TapDeck ever emits UI sounds); the user can add more apps to exclude (e.g. record everything except a video call). UI label: **"System Audio"**, with an "Exclude apps…" disclosure.
+- **`excludeBundleIDs: [String]`** — bundle ids excluded from the tap. The exclusion list ALWAYS contains System Audio Recorder's own PID (prevents feedback if System Audio Recorder ever emits UI sounds); the user can add more apps to exclude (e.g. record everything except a video call). UI label: **"System Audio"**, with an "Exclude apps…" disclosure.
 
 There is no per-app or multi-track capture mode — an earlier revision of this design supported selecting specific apps to isolate (`.appSet`, with an optional one-lane-per-app `multiTrack` mode and an unmixed `matchDeviceLayout` tap variant). It was removed: a global tap already captures whatever is playing, muting the physical output doesn't affect what the tap sees (Section 1), and maintaining per-app isolation as a second capture path wasn't worth the surface area for a single-source-at-a-time usage pattern. `muteBehavior` is `.unmuted` by default; `.mutedWhenTapped` is exposed as the **"Silent capture"** advanced toggle in Settings → Recording.
 
@@ -158,7 +158,7 @@ Status-item icon: a template waveform glyph; while recording it gains a red reco
 4. **Live meters** — per-channel peak + RMS bars, refreshed at 20 Hz from the drain thread's atomic meter snapshot (Section 5); shows the "cal" badge when displaying calibration-compensated values; hosts the clip indicator (3.7).
 5. **Elapsed time** and current session size on disk.
 6. **Health chip** — one of: ● Recording / ⚠ Rebuilding / ◌ Waiting for device / ✕ Error. Clicking it reveals the last event line (e.g. "Recovered from dropout, 240 ms gap").
-7. **Open Library** and **Settings…** items; **Quit TapDeck** (disabled with an explanatory tooltip while recording; the user must stop first — prevents accidental data loss).
+7. **Open Library** and **Settings…** items; **Quit System Audio Recorder** (disabled with an explanatory tooltip while recording; the user must stop first — prevents accidental data loss).
 
 #### 3.6.2 Library window
 
@@ -171,19 +171,19 @@ Status-item icon: a template waveform glyph; while recording it gains a red reco
 
 | Tab | Contents |
 |---|---|
-| **General** | Recordings folder (default `~/Music/TapDeck/`), session naming template with token reference (`{date} {time} {source} {app} {device} {rate}`), Dock-icon toggle, hotkey editor |
+| **General** | Recordings folder (default `~/Music/System Audio Recorder/`), session naming template with token reference (`{date} {time} {source} {app} {device} {rate}`), Dock-icon toggle, hotkey editor |
 | **Recording** | Exclusion-list editor, device policy (follow default / fixed + picker), timeline policy (`preserveWallClock` default / `compressTimeline`), Silent-capture toggle, optional segment duration/size caps (default OFF) |
 | **Formats & Export** | Default export presets, dither policy, compensation policy ("Bake compensation into master" lives here, default OFF, with its sample-modification warning) |
 | **Automation** | Shell hooks (3.11), triggers and schedules (3.12) |
-| **Advanced** | Buffer frame size (512 default, 128–4096), watchdog thresholds group (Section 8 defaults), Forced-rate mode with the verbatim warning from Section 7 ("Forcing a rate different from the output device's current rate makes macOS resample the audio before TapDeck can capture it. Only use this if you need a fixed rate more than you need maximum fidelity."), Calibration manager (per-device profiles, re-run, delete), Diagnostics/log export |
+| **Advanced** | Buffer frame size (512 default, 128–4096), watchdog thresholds group (Section 8 defaults), Forced-rate mode with the verbatim warning from Section 7 ("Forcing a rate different from the output device's current rate makes macOS resample the audio before System Audio Recorder can capture it. Only use this if you need a fixed rate more than you need maximum fidelity."), Calibration manager (per-device profiles, re-run, delete), Diagnostics/log export |
 
 #### 3.6.4 Onboarding
 
-First launch shows a single sheet (full flow specced in Section 9): what TapDeck records and why macOS will ask → **"Enable System Audio Capture"** button → `PermissionBroker` runs the throwaway-tap probe → system prompt appears → success proceeds to a 10-second guided test recording ("play some audio, press Record" — an onboarding nicety layered on top of the Section 9 permission flow, not part of it; it runs only after that flow completes); denial swaps the button for **"Open System Settings"** deep-linking to Privacy & Security → Screen & System Audio Recording. Onboarding also states plainly that the `tapdeck` CLI will request its own separate permission the first time it records.
+First launch shows a single sheet (full flow specced in Section 9): what System Audio Recorder records and why macOS will ask → **"Enable System Audio Capture"** button → `PermissionBroker` runs the throwaway-tap probe → system prompt appears → success proceeds to a 10-second guided test recording ("play some audio, press Record" — an onboarding nicety layered on top of the Section 9 permission flow, not part of it; it runs only after that flow completes); denial swaps the button for **"Open System Settings"** deep-linking to Privacy & Security → Screen & System Audio Recording. Onboarding also states plainly that the `systemaudiorecorder` CLI will request its own separate permission the first time it records.
 
 ### 3.7 Notifications, disk guard, clip indicator
 
-- **Notifications** (UserNotifications framework): recording started/stopped by a trigger; watchdog escalation ("Capture appears broken; TapDeck keeps retrying"); device-wait timeout ("Recording stopped: <device> did not return within <timeout>."); disk-space stop. No notification for manual start/stop — the user just did it.
+- **Notifications** (UserNotifications framework): recording started/stopped by a trigger; watchdog escalation ("Capture appears broken; System Audio Recorder keeps retrying"); device-wait timeout ("Recording stopped: <device> did not return within <timeout>."); disk-space stop. No notification for manual start/stop — the user just did it.
 - **Disk guard**: while any lane is recording, check free space on the recordings volume every 10 s; below **500 MB**, stop gracefully (full `FINALIZING`, manifest intact) and notify. The menu-bar dropdown shows a passive free-space readout below 5 GB.
 - **Clip indicator**: the meter block flags any sample with magnitude ≥ 1.0 and holds the indicator for 2 s. UI copy notes that float samples above 1.0 are legal and the float master preserves them unclipped — the indicator warns about *downstream* integer exports, and is one more reason the master is float.
 
@@ -193,25 +193,25 @@ Shared exit codes: **0** ok · **2** permission denied · **3** device/app not f
 
 | Verb | Behavior |
 |---|---|
-| `tapdeck record [--device <uid\|name>] [--out <dir>] [--duration <sec>] [--max-silence-stop <sec>]` | Records the global system mix until Ctrl-C, `--duration` elapses, or silence-stop fires. `--max-silence-stop N` stops after N continuous seconds of digital silence — counted only while the ZeroWatchdog does NOT classify the zeros as a dropout (a confirmed dropout triggers rebuild, not stop). Prints the session path on exit. |
-| `tapdeck devices [--json]` | Output devices with UID, channel count, current nominal rate, and a Bug-A risk flag for > 2 output channels. |
-| `tapdeck apps [--json]` | Running audio-capable processes: bundle id, PID, name, is-outputting-now. |
-| `tapdeck sessions [--json]` | Library index from `SessionStore`: path, date, source, duration, health flags. |
-| `tapdeck export <session-path> --format flac16\|flac24\|alac16\|alac24\|aac\|wav24 [--compensate-gain on\|off] [--out <dir>]` | Transcode from the CAF master (Section 6). `--compensate-gain` defaults to `on` when the manifest carries a calibration profile. |
-| `tapdeck calibrate [--device <uid\|name>]` | Runs the Bug-A calibration pass (Section 8) after an explicit y/N confirmation that a 5 s test tone will play. |
+| `systemaudiorecorder record [--device <uid\|name>] [--out <dir>] [--duration <sec>] [--max-silence-stop <sec>]` | Records the global system mix until Ctrl-C, `--duration` elapses, or silence-stop fires. `--max-silence-stop N` stops after N continuous seconds of digital silence — counted only while the ZeroWatchdog does NOT classify the zeros as a dropout (a confirmed dropout triggers rebuild, not stop). Prints the session path on exit. |
+| `systemaudiorecorder devices [--json]` | Output devices with UID, channel count, current nominal rate, and a Bug-A risk flag for > 2 output channels. |
+| `systemaudiorecorder apps [--json]` | Running audio-capable processes: bundle id, PID, name, is-outputting-now. |
+| `systemaudiorecorder sessions [--json]` | Library index from `SessionStore`: path, date, source, duration, health flags. |
+| `systemaudiorecorder export <session-path> --format flac16\|flac24\|alac16\|alac24\|aac\|wav24 [--compensate-gain on\|off] [--out <dir>]` | Transcode from the CAF master (Section 6). `--compensate-gain` defaults to `on` when the manifest carries a calibration profile. |
+| `systemaudiorecorder calibrate [--device <uid\|name>]` | Runs the Bug-A calibration pass (Section 8) after an explicit y/N confirmation that a 5 s test tone will play. |
 
 Human-readable output goes to stdout, diagnostics to stderr; `--json` variants emit stable machine-readable schemas for scripting.
 
 `--device` resolution rule: the argument is first matched as a device UID; failing that, as a case-insensitive device name. Device names are not unique — if a name matches more than one device, the command exits **3** and lists the matching UIDs on stderr so the user can retry with a UID.
 
-Runtime events during `tapdeck record` mirror the GUI: every event that would post a notification or change the health chip — dropout progression (SUSPICIOUS → confirmed → rebuild → ESCALATED), the persistent-overrun warning, device wait and device return, and the disk-space stop — is emitted as a timestamped line on stderr. A disk-space stop performs a graceful finalize and then exits **5**; a device-wait timeout performs a graceful finalize and exits **0** (a valid session was produced); ESCALATED keeps recording and keeps emitting stderr warnings.
+Runtime events during `systemaudiorecorder record` mirror the GUI: every event that would post a notification or change the health chip — dropout progression (SUSPICIOUS → confirmed → rebuild → ESCALATED), the persistent-overrun warning, device wait and device return, and the disk-space stop — is emitted as a timestamped line on stderr. A disk-space stop performs a graceful finalize and then exits **5**; a device-wait timeout performs a graceful finalize and exits **0** (a valid session was produced); ESCALATED keeps recording and keeps emitting stderr warnings.
 
 ### 3.9 URL scheme
 
-The GUI app registers `tapdeck://` (CFBundleURLTypes):
+The GUI app registers `systemaudiorecorder://` (CFBundleURLTypes):
 
-- `tapdeck://record/start` — start a system-mix recording with current settings.
-- `tapdeck://record/stop` — graceful stop.
+- `systemaudiorecorder://record/start` — start a system-mix recording with current settings.
+- `systemaudiorecorder://record/stop` — graceful stop.
 
 If a recording is already running, `start` is ignored and a notification explains why. URLs drive the GUI app's engine only (no IPC to CLI sessions).
 
@@ -231,7 +231,7 @@ Settings → Automation exposes three optional hook commands, each run non-block
 - `onSegmentClose` — after each segment finalizes (rotation or stop).
 - `onSessionFinalize` — after the manifest gains `finalizedAt`.
 
-Environment variables provided: `TAPDECK_SESSION_PATH` (always), `TAPDECK_SEGMENT_PATH` (segment-scoped hooks), `TAPDECK_EVENT` (hook name). Hooks never block or fail the capture pipeline; a timed-out hook is killed and logged.
+Environment variables provided: `SYSTEMAUDIORECORDER_SESSION_PATH` (always), `SYSTEMAUDIORECORDER_SEGMENT_PATH` (segment-scoped hooks), `SYSTEMAUDIORECORDER_EVENT` (hook name). Hooks never block or fail the capture pipeline; a timed-out hook is killed and logged.
 
 ### 3.12 Triggers
 
@@ -254,17 +254,17 @@ Trigger-started and trigger-stopped sessions always post notifications (3.7).
 
 | Target | Kind | Bundle / linkage | Contents |
 |---|---|---|---|
-| **`TapDeckRT`** | C11 static library | linked into `TapKit` | The lock-free SPSC ring buffer `td_ring_t`, the preallocated real-time capture context struct, and the only functions the IOProc ever calls: ring write, atomic host-time/frame-count stores, atomic dropped-chunk/dropped-frame counters. Depends on libc only. Full spec in Section 5. |
+| **`SystemAudioRecorderRT`** | C11 static library | linked into `TapKit` | The lock-free SPSC ring buffer `td_ring_t`, the preallocated real-time capture context struct, and the only functions the IOProc ever calls: ring write, atomic host-time/frame-count stores, atomic dropped-chunk/dropped-frame counters. Depends on libc only. Full spec in Section 5. |
 | **`TapKit`** | Swift framework | statically linked into both executables | ALL capture, device, file, watchdog, export, and trigger logic. No UI imports whatsoever. Contains every module in 4.2. |
-| **`TapDeckApp`** | GUI app | `com.tapdeck.app` | AppKit lifecycle + SwiftUI views (Section 2.5), onboarding, Library and Settings windows, menu-bar UI (Section 3). |
-| **`tapdeck`** | CLI executable | `com.tapdeck.cli`, Info.plist embedded via the `__info_plist` linker section | Fully headless. Verbs and exit codes in Section 3. Has its **own** TCC grant (own bundle id, own `NSAudioCaptureUsageDescription`) — see Section 9. |
+| **`SystemAudioRecorderApp`** | GUI app | `com.systemaudiorecorder.app` | AppKit lifecycle + SwiftUI views (Section 2.5), onboarding, Library and Settings windows, menu-bar UI (Section 3). |
+| **`systemaudiorecorder`** | CLI executable | `com.systemaudiorecorder.cli`, Info.plist embedded via the `__info_plist` linker section | Fully headless. Verbs and exit codes in Section 3. Has its **own** TCC grant (own bundle id, own `NSAudioCaptureUsageDescription`) — see Section 9. |
 
 Dependency graph (arrows = "links against"):
 
 ```
-TapDeckApp ---+
-              +---> TapKit ---> TapDeckRT
-tapdeck ------+
+SystemAudioRecorderApp ---+
+                           +---> TapKit ---> SystemAudioRecorderRT
+    systemaudiorecorder ---+
 ```
 
 `TapKit` is built for **static linkage** so the CLI ships as a single self-contained binary with no `@rpath` framework lookup. GUI and CLI each instantiate their **own `CaptureEngine`** in their own process; there is **no XPC/IPC in v1**. Consequence (accepted trade-off, stated once here and in Section 9): the user may see **two** system-audio permission prompts over the product's life — one for the app, one for the CLI.
@@ -279,7 +279,7 @@ These names are canonical; use them exactly as type names.
 
 - **`TapFactory`** — creates and destroys the `CATapDescription`, the process tap, and the private aggregate device. It owns the exact creation recipe (4.5) and executes the strict teardown order (canonical spec in Section 8). No other module ever calls `AudioHardwareCreateProcessTap`, `AudioHardwareCreateAggregateDevice`, or their destroy counterparts.
 
-- **`IOProcHost`** — registers the IOProc via `AudioDeviceCreateIOProcIDWithBlock`, passing a **`NULL` dispatch queue** so the callback fires on the HAL real-time thread. The block captures exactly one thing: an unmanaged pointer to the lane's preallocated C context struct, and only calls `TapDeckRT` C functions. `IOProcHost` also issues `AudioDeviceStart`/`AudioDeviceStop` (on the engine queue).
+- **`IOProcHost`** — registers the IOProc via `AudioDeviceCreateIOProcIDWithBlock`, passing a **`NULL` dispatch queue** so the callback fires on the HAL real-time thread. The block captures exactly one thing: an unmanaged pointer to the lane's preallocated C context struct, and only calls `SystemAudioRecorderRT` C functions. `IOProcHost` also issues `AudioDeviceStart`/`AudioDeviceStop` (on the engine queue).
 
 - **`DrainLoop`** — one dedicated `Thread` per lane (QoS `.userInitiated`), polling on a **50 ms** cycle. Per cycle: read all available whole frames from the ring (chunks ≤ 1 s), run zero-detection (vDSP max-magnitude), compute per-channel peak+RMS meters (vDSP), interleave if the tap delivered non-interleaved buffers (bit-exact reordering only), write to disk **synchronously** via `SegmentWriter`, do `ZeroWatchdog` bookkeeping, and publish a meter snapshot to an atomic slot the UI polls at 20 Hz. Full data-flow spec in Section 5.
 
@@ -306,22 +306,22 @@ These names are canonical; use them exactly as type names.
 ### 4.3 Component diagram
 
 ```
-   +----------------------------+        +----------------------------+
-   |  TapDeckApp (GUI)          |        |  tapdeck (CLI)             |
-   |  com.tapdeck.app           |        |  com.tapdeck.cli           |
-   |  AppKit lifecycle +        |        |  headless, own TCC grant   |
-   |  SwiftUI views             |        |                            |
-   +-------------+--------------+        +--------------+-------------+
-                 |    SessionSpec / start / stop / status snapshots   
-                 +-------------------------+------------+
-                                           v
- ==================  TapKit (Swift framework, no UI)  ==================
-                                           |
-     +-------------------------------------+------------------------+
-     |                       CaptureEngine                          |
-     |  owns the ENGINE QUEUE (one serial dispatch queue):          |
-     |  EVERY AudioHardware*/AudioDevice*/AudioObject* call in the  |
-     |  process runs on it -- sole exception: the IOProc callback   |
+   +--------------------------------+     +--------------------------------+
+   |  SystemAudioRecorderApp (GUI)  |     |  systemaudiorecorder (CLI)     |
+   |  com.systemaudiorecorder.app   |     |  com.systemaudiorecorder.cli   |
+   |  AppKit lifecycle +            |     |  headless, own TCC grant       |
+   |  SwiftUI views                 |     |                                |
+   +---------------+----------------+     +----------------+---------------+
+                   |    SessionSpec / start / stop / status snapshots
+                   +---------------------------+------------+
+                                               v
+ ====================  TapKit (Swift framework, no UI)  ====================
+                                               |
+     +-----------------------------------------+------------------------+
+     |                       CaptureEngine                              |
+     |  owns the ENGINE QUEUE (one serial dispatch queue):              |
+     |  EVERY AudioHardware*/AudioDevice*/AudioObject* call in the      |
+     |  process runs on it -- sole exception: the IOProc callback       |
      +--------+-----------------------------------------------------+
               | owns the single capture lane
               v
@@ -333,7 +333,7 @@ These names are canonical; use them exactly as type names.
      |  IOProcHost ------> IOProc on HAL REAL-TIME thread           |
      |       |             (C context only -- no Swift runtime)     |
      |       v                                                      |
-     |  TapDeckRT ring   (td_ring_t: lock-free SPSC byte ring)      |
+     |  SystemAudioRecorderRT ring (td_ring_t: lock-free SPSC ring) |
      |       |                                                      |
      |       v  50 ms poll, dedicated Thread per lane               |
      |  DrainLoop --+--> SegmentWriter --> <lane-slug>/segment-NNN.caf
@@ -349,20 +349,20 @@ These names are canonical; use them exactly as type names.
      | SessionStore   |  | ExportService  |  | TriggerEngine    |
      +----------------+  +----------------+  +------------------+
      (plus CalibrationService and HotkeyCenter)
- =======================================================================
-                                           |
-                                           v  (linked C static library)
-                               +----------------------+
-                               |  TapDeckRT (C11)     |
-                               |  td_ring_t + context |
-                               +----------------------+
+ =============================================================================
+                                               |
+                                               v  (linked C static library)
+                               +--------------------------------+
+                               |  SystemAudioRecorderRT (C11)   |
+                               |  td_ring_t + context           |
+                               +--------------------------------+
 ```
 
 ### 4.4 The engine-queue serialization rule
 
-`CaptureEngine` owns **one dedicated serial dispatch queue** — the **engine queue** (label `com.tapdeck.engine`, QoS `.userInitiated`; one per `CaptureEngine` instance, i.e. one per process).
+`CaptureEngine` owns **one dedicated serial dispatch queue** — the **engine queue** (label `com.systemaudiorecorder.engine`, QoS `.userInitiated`; one per `CaptureEngine` instance, i.e. one per process).
 
-**The rule:** every call into the HAL object APIs — `AudioHardware*`, `AudioDevice*`, and `AudioObject*` functions operating on `AudioObjectID`s — anywhere in the process executes on the engine queue. The **only exception** is the IOProc callback itself, which is invoked *by* the HAL on its real-time thread and calls **no Core Audio API at all** (it only calls `TapDeckRT` C functions).
+**The rule:** every call into the HAL object APIs — `AudioHardware*`, `AudioDevice*`, and `AudioObject*` functions operating on `AudioObjectID`s — anywhere in the process executes on the engine queue. The **only exception** is the IOProc callback itself, which is invoked *by* the HAL on its real-time thread and calls **no Core Audio API at all** (it only calls `SystemAudioRecorderRT` C functions).
 
 Concretely, on the engine queue: all `TapFactory` create/destroy calls, all `IOProcHost` register/start/stop/destroy calls, all `ZeroWatchdog` rebuild executions, all `DeviceObserver` listener callbacks (registered with the engine queue as their dispatch queue), all `ProcessCatalog` property reads, all `PermissionBroker` probes, and all `CalibrationService` lane setup/teardown.
 
@@ -379,10 +379,10 @@ Why the rule exists:
 This is the per-lane creation sequence. All seven steps run on the engine queue, in this order, inside the lane's `PREPARING` state (on any OSStatus error: retry once after 250 ms, then transition to `FAILED` with the OSStatus surfaced — Section 8).
 
 1. **Resolve the target device.** From the `SessionSpec` device policy (Section 7): obtain the output device's `AudioObjectID` and its device UID string; read `kAudioDevicePropertyNominalSampleRate` and the output channel count. The nominal rate is the expected capture rate (never assumed or hardcoded — Section 7); the channel count feeds the Bug-A heuristic (Section 8).
-2. **Build the `CATapDescription`** using `CATapDescription(stereoGlobalTapButExcludeProcesses:)` — always a global stereo tap, always excluding TapDeck's own PID plus the user's exclusion list (Section 3.4). Set: a human-readable name, mute behavior (`.unmuted` default, `.mutedWhenTapped` for silent capture), and **private = true**.
+2. **Build the `CATapDescription`** using `CATapDescription(stereoGlobalTapButExcludeProcesses:)` — always a global stereo tap, always excluding System Audio Recorder's own PID plus the user's exclusion list (Section 3.4). Set: a human-readable name, mute behavior (`.unmuted` default, `.mutedWhenTapped` for silent capture), and **private = true**.
 3. **Create the tap:** `AudioHardwareCreateProcessTap(description) → tapID`. Immediately read back `kAudioTapPropertyUID` (needed for step 4) and `kAudioTapPropertyFormat` (the ASBD that is ground truth for all IOProc data — Section 5; assert its rate matches step 1's nominal rate, and if not, log and trust the tap format — Section 7).
 4. **Build the aggregate-device composition dictionary** with exactly these keys, then call `AudioHardwareCreateAggregateDevice(dictionary) → aggID`:
-   - `kAudioAggregateDeviceNameKey` : `"TapDeck Capture <lane-slug>"`
+   - `kAudioAggregateDeviceNameKey` : `"System Audio Recorder Capture <lane-slug>"`
    - `kAudioAggregateDeviceUIDKey` : a fresh UUID string (unique per creation, including rebuilds)
    - `kAudioAggregateDeviceIsPrivateKey` : `true` (invisible to other apps and to the user's device list)
    - `kAudioAggregateDeviceIsStackedKey` : `false`
@@ -414,12 +414,12 @@ There are exactly four **kinds** of execution context. The IOProc thread and Dra
 
 | Context | Owner / creation | Cadence | Allowed | Forbidden |
 |---|---|---|---|---|
-| **HAL real-time IOProc thread** (one, for the lane) | Core Audio; delivered because `IOProcHost` passes a NULL dispatch queue to `AudioDeviceCreateIOProcIDWithBlock` | Every device I/O cycle (nominally 512 frames, see Section 4 recipe step 5) | The three operations in §5.2, executed by `TapDeckRT` C functions only | Locks, allocation, Swift/ObjC runtime, logging, syscalls, file I/O — anything not in §5.2 |
+| **HAL real-time IOProc thread** (one, for the lane) | Core Audio; delivered because `IOProcHost` passes a NULL dispatch queue to `AudioDeviceCreateIOProcIDWithBlock` | Every device I/O cycle (nominally 512 frames, see Section 4 recipe step 5) | The three operations in §5.2, executed by `SystemAudioRecorderRT` C functions only | Locks, allocation, Swift/ObjC runtime, logging, syscalls, file I/O — anything not in §5.2 |
 | **DrainLoop Thread** (one, for the lane) | `DrainLoop`, a dedicated `Thread` at QoS `.userInitiated` | 50 ms poll cycle | Ring reads, vDSP zero-scan and metering, interleave, synchronous `ExtAudioFileWrite`, watchdog bookkeeping, meter-snapshot publication | Any `AudioHardware*` lifecycle call; UI work |
 | **Engine queue** (one per process) | `CaptureEngine`'s dedicated serial dispatch queue | Event-driven | All Core Audio object lifecycle (create/start/stop/destroy of taps, aggregates, IOProcs), `ZeroWatchdog` rebuild execution (state transitions run on the drain thread, Section 8), `DeviceObserver` callbacks (dispatched onto it), handing event records to `SessionStore` (which serializes manifest file I/O on its own dedicated serial queue) | Touching ring payload; blocking on the DrainLoop |
 | **Main thread** | AppKit/SwiftUI | UI events; 20 Hz meter poll timer | Reading the published meter snapshot, all UI, notifications | Everything else in this section |
 
-The IOProc thread is created, scheduled, and destroyed by the HAL; TapDeck never blocks it, signals it, or joins it. The DrainLoop Thread is started when the lane enters RUNNING and is asked to finish (drain-fully, then exit) when the lane enters STOPPING (Section 8). The engine queue serializes every lifecycle mutation so a rebuild can never race a stop.
+The IOProc thread is created, scheduled, and destroyed by the HAL; System Audio Recorder never blocks it, signals it, or joins it. The DrainLoop Thread is started when the lane enters RUNNING and is asked to finish (drain-fully, then exit) when the lane enters STOPPING (Section 8). The engine queue serializes every lifecycle mutation so a rebuild can never race a stop.
 
 ### 5.2 The IOProc contract (verbatim, non-negotiable)
 
@@ -429,7 +429,7 @@ The block captured at registration holds only an unmanaged pointer to a prealloc
 
 ### 5.3 Ring buffer: `td_ring_t`
 
-A single-producer / single-consumer **byte** ring in the `TapDeckRT` C library. One producer (the IOProc thread), one consumer (the DrainLoop Thread) — never more, which is what makes the lock-free design sound.
+A single-producer / single-consumer **byte** ring in the `SystemAudioRecorderRT` C library. One producer (the IOProc thread), one consumer (the DrainLoop Thread) — never more, which is what makes the lock-free design sound.
 
 - **Capacity**: next power of two ≥ 8 seconds × sampleRate × channels × 4 bytes (Float32). Sizing math:
   - 48 kHz stereo: 48,000 × 2 × 4 = 384,000 B/s; × 8 s = 3,072,000 B (≈ 3 MiB) → round up to **4 MiB** (4,194,304 B ≈ 10.9 s real headroom).
@@ -440,7 +440,7 @@ A single-producer / single-consumer **byte** ring in the `TapDeckRT` C library. 
 - **Whole-frame framing**: the payload is raw sample bytes with no headers. The writer only ever writes whole frames; the reader only ever reads whole frames (both sides operate in multiples of bytesPerFrame), so the logical stream is always frame-aligned. In planar mode both sides additionally operate in multiples of one whole callback chunk — itself a whole-frame multiple — per the layout rule in the next bullet.
 - **Tap-native-layout-in-ring invariant**: the ring always contains the tap ASBD's **native layout**, and `td_ring_write` is always a plain bounded byte copy — never a sample reordering. Interleaving is the DrainLoop Thread's job (§5.4 step 5), per the fidelity rules in Section 7. Two cases:
   - **Interleaved tap format** (the expected case — `kAudioTapPropertyFormat` reports interleaved Float32): the AudioBufferList carries one buffer; `td_ring_write` copies its bytes verbatim. Any whole-frame count is accepted; no chunk-boundary knowledge is needed downstream, and drain step 5 is a no-op.
-  - **Non-interleaved (planar) tap format** (not expected in practice now that `matchDeviceLayout` and per-app capture are gone, Section 3.4 — the only tap TapDeck builds is the global stereo-mixdown tap, which reports interleaved Float32; this path is retained defensively in case that assumption ever proves wrong on some device/OS combination): the AudioBufferList carries one buffer per channel plane. `td_ring_write` copies the planes **back-to-back in channel order** (all of plane 0's bytes, then all of plane 1's, …) as one all-or-nothing chunk — still plain sequential byte copies, one per plane, with no per-sample striding. The chunk's byte count is frames × channels × 4 = a whole-frame multiple, so the byte-level framing invariant is preserved. **Deterministic parseability rule**: in planar mode every ring chunk is exactly `framesPerCallback` frames, where `framesPerCallback` = the aggregate's `kAudioDevicePropertyBufferFrameSize` (512 default; Section 4 recipe step 5), recorded in the C context at lane build. The drain therefore reads and deinterleaves in exact multiples of one callback chunk (framesPerCallback × channels × 4 bytes) with no headers in the stream. If a planar-mode callback ever delivers a different frame count (not expected from a HAL IOProc running with a fixed buffer frame size), the producer must not write an unparseable chunk: it drops the whole chunk via the standard drop-all-or-nothing path (`droppedChunks` += 1, `droppedFrames` += chunk frames; the drain logs the resulting `overrunGap` event, §5.4 step 7).
+  - **Non-interleaved (planar) tap format** (not expected in practice now that `matchDeviceLayout` and per-app capture are gone, Section 3.4 — the only tap System Audio Recorder builds is the global stereo-mixdown tap, which reports interleaved Float32; this path is retained defensively in case that assumption ever proves wrong on some device/OS combination): the AudioBufferList carries one buffer per channel plane. `td_ring_write` copies the planes **back-to-back in channel order** (all of plane 0's bytes, then all of plane 1's, …) as one all-or-nothing chunk — still plain sequential byte copies, one per plane, with no per-sample striding. The chunk's byte count is frames × channels × 4 = a whole-frame multiple, so the byte-level framing invariant is preserved. **Deterministic parseability rule**: in planar mode every ring chunk is exactly `framesPerCallback` frames, where `framesPerCallback` = the aggregate's `kAudioDevicePropertyBufferFrameSize` (512 default; Section 4 recipe step 5), recorded in the C context at lane build. The drain therefore reads and deinterleaves in exact multiples of one callback chunk (framesPerCallback × channels × 4 bytes) with no headers in the stream. If a planar-mode callback ever delivers a different frame count (not expected from a HAL IOProc running with a fixed buffer frame size), the producer must not write an unparseable chunk: it drops the whole chunk via the standard drop-all-or-nothing path (`droppedChunks` += 1, `droppedFrames` += chunk frames; the drain logs the resulting `overrunGap` event, §5.4 step 7).
 - **Overflow — drop-all-or-nothing**: before copying, the producer computes free space; if the incoming chunk does not fit **entirely**, nothing is written: `droppedChunks` += 1, `droppedFrames` += chunk frame count. Partial frames or partial chunks are never written, so the ring can never contain a torn frame. The drain detects counter deltas and logs `overrunGap` events (§5.4 step 7).
 
 ### 5.4 Drain cycle, step by step
@@ -505,11 +505,11 @@ Captured only on the IOProc thread, consumed everywhere else:
 
 ### 6.1 Master format: CAF, Float32, interleaved — and exactly why
 
-Every master (archival) recording TapDeck makes is a **Core Audio Format (CAF) file containing 32-bit float, interleaved, packed linear PCM at the tap-native sample rate** (see Section 7 for how that rate is determined). This is non-negotiable, for four reasons:
+Every master (archival) recording System Audio Recorder makes is a **Core Audio Format (CAF) file containing 32-bit float, interleaved, packed linear PCM at the tap-native sample rate** (see Section 7 for how that rate is determined). This is non-negotiable, for four reasons:
 
-1. **The float-in-WAV truncation bug.** Known Core Audio bug (established research fact, quoted verbatim): "requesting 32-bit float samples written into a WAV container (via AVAudioFile or ExtAudioFile) can silently get truncated/converted to Int32." Silent — no error is returned; the file simply is not float anymore. WAV is therefore **never** used as a master or capture format anywhere in TapDeck. WAV appears only as a 24-bit integer *compatibility export* (Section 6.6), and the export UI copy must state why WAV is not offered as a float master, citing this bug.
+1. **The float-in-WAV truncation bug.** Known Core Audio bug (established research fact, quoted verbatim): "requesting 32-bit float samples written into a WAV container (via AVAudioFile or ExtAudioFile) can silently get truncated/converted to Int32." Silent — no error is returned; the file simply is not float anymore. WAV is therefore **never** used as a master or capture format anywhere in System Audio Recorder. WAV appears only as a 24-bit integer *compatibility export* (Section 6.6), and the export UI copy must state why WAV is not offered as a float master, citing this bug.
 2. **64-bit chunk sizes.** CAF chunk sizes are 64-bit, so there is no 4 GB file-size ceiling. Long sessions at high rates (192 kHz, 8 channels) run for hours without forced rotation. A 4 GB+ single-segment test is mandatory (see Section 10).
-3. **Unknown-size data chunk = crash-safe streaming.** The CAF `data` chunk's size field may legally be written as **-1** ("unknown size"), which makes the file a valid streaming CAF readable to end-of-file at all times. TapDeck writes every segment this way while recording and patches the real size and frame count only at finalization. If the app or machine dies mid-recording, the segment on disk is already a playable file (see Section 6.5).
+3. **Unknown-size data chunk = crash-safe streaming.** The CAF `data` chunk's size field may legally be written as **-1** ("unknown size"), which makes the file a valid streaming CAF readable to end-of-file at all times. System Audio Recorder writes every segment this way while recording and patches the real size and frame count only at finalization. If the app or machine dies mid-recording, the segment on disk is already a playable file (see Section 6.5).
 4. **Native Core Audio container.** CAF is Core Audio's own format: ExtAudioFile writes it with zero format impedance, every Apple tool reads it, and no third-party codec code is needed.
 
 **AIFC is the permitted-but-not-chosen fallback.** AIFC also carries float PCM safely and is acceptable per the research constraints, but it lacks CAF's 64-bit sizes and the documented -1 streaming-data-chunk behavior. The decision is CAF; AIFC exists in this document only as the sanctioned escape hatch if a real-world CAF blocker appears during implementation.
@@ -543,7 +543,7 @@ If the tap delivers non-interleaved buffers, the DrainLoop interleaves them (pur
 
 ### 6.3 On-disk layout
 
-- **Recordings root:** `~/Music/TapDeck/` (user-configurable in Settings → General). Session folders are direct children of the root.
+- **Recordings root:** `~/Music/System Audio Recorder/` (user-configurable in Settings → General). Session folders are direct children of the root.
 - **Session folder name template** (configurable; default): `{date} {time} — {source}` → e.g. `2026-07-14 09.41.03 — Spotify`.
   - Tokens: `{date}` = local date `YYYY-MM-DD`; `{time}` = local time `HH.MM.SS` (dots, not colons — colons are illegal in macOS filenames); `{source}` / `{app}` = always "System Audio"; `{device}` = target device name; `{rate}` = nominal rate at session start formatted as `48kHz` / `44.1kHz` / `192kHz`.
   - Sanitization: replace `/`, `:`, and control characters with `-`; collapse runs of whitespace; trim; cap at **200 bytes of UTF-8** (bytes, not characters — truncate only at a character boundary so no code point is split). On collision, append ` (2)`, ` (3)`, ….
@@ -663,7 +663,7 @@ Bit-depth reduction rules: 24-bit = plain rounding (transparent); 16-bit = TPDF 
 
 ### 7.1 The governing fact
 
-macOS does **not** auto-switch a physical output device's sample rate to match content. If the device runs at a different rate than the source material, the OS resamples *before the tap ever sees the audio*, and nothing TapDeck does downstream can undo that. Therefore the only fidelity-correct capture rate is **whatever rate the target output device is actually running at right now**. TapDeck never assumes, never hardcodes, and never prefers 44.1 kHz or 48 kHz; any literal rate constant in the capture path is a code-review reject (tests in Section 10 cover this).
+macOS does **not** auto-switch a physical output device's sample rate to match content. If the device runs at a different rate than the source material, the OS resamples *before the tap ever sees the audio*, and nothing System Audio Recorder does downstream can undo that. Therefore the only fidelity-correct capture rate is **whatever rate the target output device is actually running at right now**. System Audio Recorder never assumes, never hardcodes, and never prefers 44.1 kHz or 48 kHz; any literal rate constant in the capture path is a code-review reject (tests in Section 10 cover this).
 
 ### 7.2 Lane-start procedure (rate resolution)
 
@@ -700,7 +700,7 @@ Device/rate notifications can arrive in bursts (a single AirPods connection can 
 
 ### 7.5 Device policy: `.fixed(deviceUID)` and WAITING_FOR_DEVICE
 
-With a fixed device, TapDeck follows that device's rate changes (Section 7.3) but never follows the system default. (A fixed device that is already absent at lane start never reaches this state — that is a PREPARING → FAILED "device not found" error, Section 7.2.) If, while the lane is RUNNING, `DeviceObserver`'s device-list listener reports the fixed device gone (unplugged, Bluetooth drop):
+With a fixed device, System Audio Recorder follows that device's rate changes (Section 7.3) but never follows the system default. (A fixed device that is already absent at lane start never reaches this state — that is a PREPARING → FAILED "device not found" error, Section 7.2.) If, while the lane is RUNNING, `DeviceObserver`'s device-list listener reports the fixed device gone (unplugged, Bluetooth drop):
 
 1. Drain the ring fully, finalize the current segment (protecting all captured audio), and move the lane to **WAITING_FOR_DEVICE** (state machine in Section 8). On entry the lane immediately performs the full strict teardown of the dead device's objects (Section 8 order; the destroy calls tolerate non-noErr results from an already-gone device), so if the device returns only the rebuild half remains to run. The session and manifest stay open; the UI health chip shows "◌ Waiting for device"; a `waitingForDevice` event is logged with `details = {deviceUID, resumed: false}`.
 2. Wait up to `waitForDeviceTimeout` — **default 5 minutes**, configurable (Settings → Recording). While waiting, each device-list-changed notification re-checks for a device whose UID matches.
@@ -711,11 +711,11 @@ With a fixed device, TapDeck follows that device's rate changes (Section 7.3) bu
 
 An ADVANCED setting, **default off** (Settings → Advanced). It exists purely for convenience workflows that require one fixed rate across device switches; it is a deliberate fidelity trade-off. The setting must display this warning verbatim wherever it is enabled:
 
-> "Forcing a rate different from the output device's current rate makes macOS resample the audio before TapDeck can capture it. Only use this if you need a fixed rate more than you need maximum fidelity."
+> "Forcing a rate different from the output device's current rate makes macOS resample the audio before System Audio Recorder can capture it. Only use this if you need a fixed rate more than you need maximum fidelity."
 
 **Mechanism (UNVERIFIED — full entry in Open Risks, Section 11).** Behavior when enabled with rate R:
 
-- After creating the private aggregate device (recipe step 4, Section 4), set `kAudioDevicePropertyNominalSampleRate = R` on the **aggregate device**. Be honest about what this does: an aggregate device's supported rates are the intersection of its sub-devices' rates, and setting the aggregate's nominal rate **propagates to its sub-devices** — including the real physical output device that is the aggregate's main sub-device and clock master (Section 4 recipe). The expected outcome is therefore either (a) success, which **changes the user's physical output device to R Hz** — audible to every other app on the system — or (b) failure, if the physical device does not support R. Note that `kAudioSubTapDriftCompensationKey = true` (already in the recipe) only corrects clock drift between devices running at the same nominal rate; it does **not** decouple the aggregate's rate from its main sub-device. This design makes no "TapDeck won't touch your device configuration" promise in forced-rate mode — it cannot.
+- After creating the private aggregate device (recipe step 4, Section 4), set `kAudioDevicePropertyNominalSampleRate = R` on the **aggregate device**. Be honest about what this does: an aggregate device's supported rates are the intersection of its sub-devices' rates, and setting the aggregate's nominal rate **propagates to its sub-devices** — including the real physical output device that is the aggregate's main sub-device and clock master (Section 4 recipe). The expected outcome is therefore either (a) success, which **changes the user's physical output device to R Hz** — audible to every other app on the system — or (b) failure, if the physical device does not support R. Note that `kAudioSubTapDriftCompensationKey = true` (already in the recipe) only corrects clock drift between devices running at the same nominal rate; it does **not** decouple the aggregate's rate from its main sub-device. This design makes no "System Audio Recorder won't touch your device configuration" promise in forced-rate mode — it cannot.
 - **Required UI disclosure**, shown alongside the verbatim resampling warning both when the mode is enabled and at record start while it is active: "Force capture rate will also switch your output device to <R> Hz while recording. Other apps will hear the device at that rate." The device's prior nominal rate is saved at lane start and restored best-effort at session finalization (restore failure is logged, never fatal).
 - If setting R fails (the device does not support R): fail the lane in PREPARING with the OSStatus surfaced and the message "Device does not support <R> Hz". Never silently fall back to the device's current rate while the manifest would claim R.
 - Ground truth for the IOProc bytes is the aggregate input stream's virtual format (`kAudioStreamPropertyVirtualFormat`): read it back after the rate set and assert it is Float32 at R; on assertion failure, fail the lane. This virtual format replaces the tap format as the ASBD/ring-sizing ground truth (the exceptions are stated in Sections 7.2 and 6.2).
@@ -729,13 +729,13 @@ An ADVANCED setting, **default off** (Settings → Advanced). It exists purely f
 
 - Capture rate = tap-native rate = device nominal rate at lane start (unless forced-rate mode, which is loud about its costs — Section 7.6).
 - The effective IOProc format always wins over expectations; nothing is ever hardcoded. Normally that is the tap format (`kAudioTapPropertyFormat`); in forced-rate mode only, it is the aggregate input stream's virtual format (`kAudioStreamPropertyVirtualFormat`) per Section 7.6.
-- Any observed change in the effective IOProc format — from a rate change or a device change, in every mode including forced-rate — ⇒ full teardown/rebuild (Section 8 order) + segment rotation + manifest event. No partial restarts, no in-file rate mixing, no SRC inside TapDeck's own code path, ever.
+- Any observed change in the effective IOProc format — from a rate change or a device change, in every mode including forced-rate — ⇒ full teardown/rebuild (Section 8 order) + segment rotation + manifest event. No partial restarts, no in-file rate mixing, no SRC inside System Audio Recorder's own code path, ever.
 
 ---
 
 ## 8. Error Handling & Recovery Design
 
-This section is the safety-critical core of TapDeck. It owns the canonical `ZeroWatchdog` specification (Bug-B all-zero dropout recovery), the canonical STRICT teardown order, the Bug-A level-attenuation response, the lane state machine, device-switch and sample-rate-change handling, ring-overrun and disk-space policy, and startup crash recovery. Sections 4, 5, 6, and 7 reference this section rather than restating it.
+This section is the safety-critical core of System Audio Recorder. It owns the canonical `ZeroWatchdog` specification (Bug-B all-zero dropout recovery), the canonical STRICT teardown order, the Bug-A level-attenuation response, the lane state machine, device-switch and sample-rate-change handling, ring-overrun and disk-space policy, and startup crash recovery. Sections 4, 5, 6, and 7 reference this section rather than restating it.
 
 ### 8.1 ZeroWatchdog — full specification (Bug B)
 
@@ -764,7 +764,7 @@ This section is the safety-critical core of TapDeck. It owns the canonical `Zero
 | ESCALATED | SUSPICIOUS | 60 s retry timer fires AND fresh snapshot says "no one is playing" — zeros are now indistinguishable from genuine silence; the escalation notification is withdrawn |
 | ESCALATED | NORMAL | any nonzero sample |
 
-**Backoff and attempt budget.** Delay before rebuild attempt N within one dropout episode: attempt 1 → **0.5 s**, attempt 2 → **2 s**, attempt 3 → **5 s**. Hard cap: **3 attempts per 10-minute sliding window** (window tracked by attempt wall-clock timestamps). A "failed attempt" is either (a) a rebuild that completed but failed `POST_REBUILD_VERIFY`, or (b) a recreation step that returned a non-`noErr` OSStatus — in case (b) the engine tears down whatever was partially created (8.2 order) before the next attempt. Both kinds consume the budget (8.4 gives the separate failure policy for non-watchdog rebuilds). Exhausting the cap enters `ESCALATED`: post a UserNotifications alert with the copy "Capture appears broken; TapDeck keeps retrying", keep the lane capturing (if the last recreation succeeded, the IOProc continues delivering zeros; the writer stays open in every case), set the menu-bar health chip to ⚠, and arm a retry timer that fires every **60 s**.
+**Backoff and attempt budget.** Delay before rebuild attempt N within one dropout episode: attempt 1 → **0.5 s**, attempt 2 → **2 s**, attempt 3 → **5 s**. Hard cap: **3 attempts per 10-minute sliding window** (window tracked by attempt wall-clock timestamps). A "failed attempt" is either (a) a rebuild that completed but failed `POST_REBUILD_VERIFY`, or (b) a recreation step that returned a non-`noErr` OSStatus — in case (b) the engine tears down whatever was partially created (8.2 order) before the next attempt. Both kinds consume the budget (8.4 gives the separate failure policy for non-watchdog rebuilds). Exhausting the cap enters `ESCALATED`: post a UserNotifications alert with the copy "Capture appears broken; System Audio Recorder keeps retrying", keep the lane capturing (if the last recreation succeeded, the IOProc continues delivering zeros; the writer stays open in every case), set the menu-bar health chip to ⚠, and arm a retry timer that fires every **60 s**.
 
 **The escalated retry decision.** At each 60 s timer fire, the watchdog reads the corroboration snapshot (freshness rule below) and takes exactly one of three actions:
 1. Fresh snapshot says "audio expected" → `REBUILDING` (one full rebuild attempt).
@@ -773,7 +773,7 @@ This section is the safety-critical core of TapDeck. It owns the canonical `Zero
 Escalated retries bypass the 0.5/2/5 s backoff schedule — the 60 s cadence is itself the throttle — but each one still counts as an attempt in the sliding 10-minute window, so a failed escalated attempt normally returns straight to `ESCALATED` via the 3-failed-attempts row and re-arms the timer; if the window has aged below 3 attempts, the normal backoff path resumes instead. This loop continues until nonzero audio returns or the user stops the session.
 
 **The corroboration signal.** While any lane's watchdog is in ANY state other than `NORMAL` — i.e. `SUSPICIOUS`, `CONFIRMED_DROPOUT`, `REBUILDING`, `POST_REBUILD_VERIFY`, or `ESCALATED` — `ProcessCatalog` polls at 1 Hz answering "is any relevant process currently outputting audio?" via `kAudioProcessPropertyIsRunningOutput` on each process object from `kAudioHardwarePropertyProcessObjectList`. Polling must cover the entire dropout episode — not just `SUSPICIOUS` — because the state table above consumes LIVE corroboration outside `SUSPICIOUS`: the `POST_REBUILD_VERIFY` exits ("no one is playing" → `SUSPICIOUS`; "corroborated zeros ≥ 10 s" → next attempt) and each `ESCALATED` retry decision all depend on it. Polling stops only when the watchdog returns to `NORMAL`. This same trigger condition — watchdog in any non-`NORMAL` state — appears in `ProcessCatalog`'s trigger list (see Section 4).
-Check all processes EXCLUDING TapDeck's own PID and any processes matching the lane's `excludeBundleIDs` (excluded apps are not captured, so their output must not corroborate a dropout). A poll is "corroborated" when at least one relevant process reports `IsRunningOutput = true`. The confirm condition requires the latest 3 polls all corroborated.
+Check all processes EXCLUDING System Audio Recorder's own PID and any processes matching the lane's `excludeBundleIDs` (excluded apps are not captured, so their output must not corroborate a dropout). A poll is "corroborated" when at least one relevant process reports `IsRunningOutput = true`. The confirm condition requires the latest 3 polls all corroborated.
 
 **Snapshot freshness rule.** Every published snapshot carries its poll timestamp. A snapshot older than **3 s** is STALE and is treated as unavailable: it never counts as corroborated, and it never counts as evidence that "no one is playing" either. Every watchdog decision that reads corroboration — the SUSPICIOUS confirm, the corroborated `POST_REBUILD_VERIFY` exits, and each `ESCALATED` retry decision — uses only fresh (≤ 3 s old) snapshots. If the snapshot stays stale while the watchdog is outside `NORMAL`, each additional full second of staleness counts as one errored corroboration read toward the "≥ 3 consecutive corroboration reads errored or stale" condition of the two uncorroborated fallback rows (SUSPICIOUS → CONFIRMED_DROPOUT at zero-run ≥ 60 s, and POST_REBUILD_VERIFY → next REBUILDING attempt at ≥ 60 s since the rebuild). In `ESCALATED`, a stale or errored snapshot at timer fire selects action 3 of the escalated retry decision (rebuild anyway). No state can therefore hang waiting for corroboration that never arrives.
 
@@ -806,8 +806,8 @@ Teardown error handling: if any step returns a non-`noErr` OSStatus (e.g. the de
 
 Captured level can scale down with the number of stereo output pairs the target device exposes (~12 dB observed on a 4-pair interface; ~0 dB on true 2-channel devices). Three layers, fidelity-first:
 
-1. **Heuristic warning.** Whenever the target output device exposes > 2 output channels, show a persistent badge/warning in the menu-bar UI and `tapdeck devices` output: "This device exposes N output channels; a known macOS bug may attenuate captured level — roughly 20·log₁₀(number of stereo pairs) dB, about 12 dB on a 4-pair interface. Run Calibration or choose a 2-channel device for exact levels." (The scaling law: level scales roughly as 20·log₁₀ of the output stereo-pair count, i.e. ~6 dB per *doubling* of pairs, consistent with the ~12 dB measured at 4 pairs.) Re-evaluated on every device switch (8.5).
-2. **Calibration (user-invoked, `CalibrationService`).** Explicit consent dialog first: "TapDeck will play a 5-second test tone through <device>." Then play a **997 Hz sine at −20 dBFS for 5 s** through the target device while capturing through a temporary lane; measure captured RMS over the **middle 3 s** (discarding the first and last second skips ramp/settling); `gainCompensationDB = −20 − capturedRMSdB`. Store the profile keyed by `(deviceUID, outputChannelCount, macOSBuild)`; any key component changing invalidates it. Profiles live in a JSON file at `~/Library/Application Support/TapDeck/calibration.json`, read and written by both the GUI and the CLI (separate processes, no IPC) and always written atomically via a temp file + rename so a concurrent reader never sees a partial write. Per-profile schema: `{deviceUID, outputChannelCount, macOSBuild, gainCompensationDB, measuredAt, referenceVolume}` — `referenceVolume` is nullable (see R1). The session manifest snapshots the profile in use at record time, so later recalibration never silently changes an existing session's interpretation. Open-Risks note (Section 11): whether the tap level is pre- or post-hardware-volume must be verified hands-on; if pre-volume, calibration can run at low device volume without loud playback.
+1. **Heuristic warning.** Whenever the target output device exposes > 2 output channels, show a persistent badge/warning in the menu-bar UI and `systemaudiorecorder devices` output: "This device exposes N output channels; a known macOS bug may attenuate captured level — roughly 20·log₁₀(number of stereo pairs) dB, about 12 dB on a 4-pair interface. Run Calibration or choose a 2-channel device for exact levels." (The scaling law: level scales roughly as 20·log₁₀ of the output stereo-pair count, i.e. ~6 dB per *doubling* of pairs, consistent with the ~12 dB measured at 4 pairs.) Re-evaluated on every device switch (8.5).
+2. **Calibration (user-invoked, `CalibrationService`).** Explicit consent dialog first: "System Audio Recorder will play a 5-second test tone through <device>." Then play a **997 Hz sine at −20 dBFS for 5 s** through the target device while capturing through a temporary lane; measure captured RMS over the **middle 3 s** (discarding the first and last second skips ramp/settling); `gainCompensationDB = −20 − capturedRMSdB`. Store the profile keyed by `(deviceUID, outputChannelCount, macOSBuild)`; any key component changing invalidates it. Profiles live in a JSON file at `~/Library/Application Support/System Audio Recorder/calibration.json`, read and written by both the GUI and the CLI (separate processes, no IPC) and always written atomically via a temp file + rename so a concurrent reader never sees a partial write. Per-profile schema: `{deviceUID, outputChannelCount, macOSBuild, gainCompensationDB, measuredAt, referenceVolume}` — `referenceVolume` is nullable (see R1). The session manifest snapshots the profile in use at record time, so later recalibration never silently changes an existing session's interpretation. Open-Risks note (Section 11): whether the tap level is pre- or post-hardware-volume must be verified hands-on; if pre-volume, calibration can run at low device volume without loud playback.
 3. **Compensation policy.** The MASTER file is ALWAYS written raw/untouched — no gain on the capture path, ever. `gainCompensationDB` is stored in the session manifest (`lanes[].calibration`). Live meters display compensated values with a small "cal" badge. `ExportService` offers "Apply level compensation" (a single float scalar multiply), default **ON** when a profile exists, stated in the export UI. The Advanced setting "Bake compensation into master" defaults **OFF**, with a warning that it modifies samples.
 
 ### 8.4 Lane state machine
@@ -858,7 +858,7 @@ any state → FAILED(reason)
 
 ### 8.7 Startup crash recovery
 
-CAF masters are written with the unknown-size (`-1`) audio data chunk, so a crash mid-recording leaves a valid, readable-to-EOF file. The launch-time recovery scan — identifying candidates by missing/null `finalizedAt`, the 30 s recency guard (Section 6.5), truncating mid-frame-crashed segments to the last whole-frame boundary before patching, patching CAF data-chunk sizes and frame counts, setting `session.recovered = true` and stamping `finalizedAt`, and synthesizing a minimal manifest for orphaned segment folders — is owned canonically by **Section 6.5**; this section deliberately does not restate the procedure, and where any wording differs, Section 6.5 wins. From the error-handling perspective the guarantees are: recovery is idempotent, runs before the library index is served (users never see a corrupt-looking session), never touches a session another live TapDeck process (GUI vs CLI — no IPC) is still writing, and surfaces every recovered session with the "Recovered" health badge (Section 3).
+CAF masters are written with the unknown-size (`-1`) audio data chunk, so a crash mid-recording leaves a valid, readable-to-EOF file. The launch-time recovery scan — identifying candidates by missing/null `finalizedAt`, the 30 s recency guard (Section 6.5), truncating mid-frame-crashed segments to the last whole-frame boundary before patching, patching CAF data-chunk sizes and frame counts, setting `session.recovered = true` and stamping `finalizedAt`, and synthesizing a minimal manifest for orphaned segment folders — is owned canonically by **Section 6.5**; this section deliberately does not restate the procedure, and where any wording differs, Section 6.5 wins. From the error-handling perspective the guarantees are: recovery is idempotent, runs before the library index is served (users never see a corrupt-looking session), never touches a session another live System Audio Recorder process (GUI vs CLI — no IPC) is still writing, and surfaces every recovered session with the "Recovered" health badge (Section 3).
 
 ---
 
@@ -868,31 +868,31 @@ CAF masters are written with the unknown-size (`-1`) audio data chunk, so a cras
 
 System-audio capture via the Process Tap API is gated by the TCC service **SystemAudioCaptureRequests**. The requesting binary MUST carry the Info.plist key **`NSAudioCaptureUsageDescription`**. This key does **not** appear in Xcode's Info.plist key dropdown — type the raw key name manually (add row and paste the literal string, or edit the plist source). Its value, identical in both binaries, is exactly:
 
-> TapDeck records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.
+> System Audio Recorder records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.
 
-- **GUI app** (`com.tapdeck.app`): key goes in the normal `TapDeck.app/Contents/Info.plist`.
-- **CLI** (`com.tapdeck.cli`): a bare Mach-O executable has no bundle, so the CLI embeds a complete Info.plist into its binary via the `__TEXT,__info_plist` linker section. Add to the `tapdeck` target's OTHER_LDFLAGS: `-Wl,-sectcreate,__TEXT,__info_plist,$(SRCROOT)/tapdeck/tapdeck-Info.plist`. That plist contains at minimum: `CFBundleIdentifier` = `com.tapdeck.cli`, `CFBundleName` = `tapdeck`, `CFBundleShortVersionString` and `CFBundleVersion` (lockstep with the app's), `LSMinimumSystemVersion` = `14.4`, and `NSAudioCaptureUsageDescription` with the exact string above. TCC reads the embedded plist exactly as it would a bundle's.
+- **GUI app** (`com.systemaudiorecorder.app`): key goes in the normal `System Audio Recorder.app/Contents/Info.plist`.
+- **CLI** (`com.systemaudiorecorder.cli`): a bare Mach-O executable has no bundle, so the CLI embeds a complete Info.plist into its binary via the `__TEXT,__info_plist` linker section. Add to the `systemaudiorecorder` target's OTHER_LDFLAGS: `-Wl,-sectcreate,__TEXT,__info_plist,$(SRCROOT)/systemaudiorecorder/systemaudiorecorder-Info.plist`. That plist contains at minimum: `CFBundleIdentifier` = `com.systemaudiorecorder.cli`, `CFBundleName` = `systemaudiorecorder`, `CFBundleShortVersionString` and `CFBundleVersion` (lockstep with the app's), `LSMinimumSystemVersion` = `14.4`, and `NSAudioCaptureUsageDescription` with the exact string above. TCC reads the embedded plist exactly as it would a bundle's.
 
 ### 9.2 Why two separate TCC grants
 
-TCC keys each grant to the *requesting* binary's stable code-signing identity plus bundle identifier. The app and CLI are different executables with different bundle ids, and per Section 4 they do not talk to each other (no XPC/IPC in v1) — neither can borrow the other's grant. A user of both surfaces therefore sees **two** system prompts and **two** rows in System Settings. This is the accepted v1 trade-off: it keeps the CLI fully headless and standalone. The embedded Info.plist is what attaches the CLI's grant to `com.tapdeck.cli` itself rather than to the invoking terminal. Background fact to respect from day one: ad-hoc or unsigned builds may never reliably trigger or retain the permission, so even development builds must be signed with a stable certificate (Developer ID, or at least Apple Development).
+TCC keys each grant to the *requesting* binary's stable code-signing identity plus bundle identifier. The app and CLI are different executables with different bundle ids, and per Section 4 they do not talk to each other (no XPC/IPC in v1) — neither can borrow the other's grant. A user of both surfaces therefore sees **two** system prompts and **two** rows in System Settings. This is the accepted v1 trade-off: it keeps the CLI fully headless and standalone. The embedded Info.plist is what attaches the CLI's grant to `com.systemaudiorecorder.cli` itself rather than to the invoking terminal. Background fact to respect from day one: ad-hoc or unsigned builds may never reliably trigger or retain the permission, so even development builds must be signed with a stable certificate (Developer ID, or at least Apple Development).
 
 ### 9.3 User-visible TCC flow, step by step
 
 1. **First run**: onboarding sheet (Section 3) explains what will happen, with one button: **"Enable System Audio Capture."**
-2. Pressing it calls `PermissionBroker.requestCapturePermission()` (below), which attempts a minimal throwaway tap. Because no grant exists yet, macOS presents a modal prompt, approximately: *"TapDeck" would like to record this computer's audio*, with our §9.1 usage string as the explanation and **Allow** / **Don't Allow** buttons. The chrome is OS-controlled; only the description string is ours.
-3. **Allow** → probe tap creation succeeds; the grant is recorded under **System Settings → Privacy & Security → Screen & System Audio Recording** as a row named "TapDeck" (the CLI gets its own row, "tapdeck," after its first request). Sub-grouping inside that pane varies by macOS release — cosmetic only.
+2. Pressing it calls `PermissionBroker.requestCapturePermission()` (below), which attempts a minimal throwaway tap. Because no grant exists yet, macOS presents a modal prompt, approximately: *"System Audio Recorder" would like to record this computer's audio*, with our §9.1 usage string as the explanation and **Allow** / **Don't Allow** buttons. The chrome is OS-controlled; only the description string is ours.
+3. **Allow** → probe tap creation succeeds; the grant is recorded under **System Settings → Privacy & Security → Screen & System Audio Recording** as a row named "System Audio Recorder" (the CLI gets its own row, "systemaudiorecorder," after its first request). Sub-grouping inside that pane varies by macOS release — cosmetic only.
 4. **Don't Allow** → the probe fails with a nonzero OSStatus. macOS shows the prompt **once**; later tap-creation attempts fail silently with no new prompt. The user must flip the toggle in System Settings manually.
 5. **Denial UX**: on probe failure the sheet swaps to a denial state: text naming the exact pane, plus an "Open System Settings" button opening `x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture`. The anchor is unverified (Risk R4, Section 11); if it fails testing, use the anchor-less `x-apple.systempreferences:com.apple.preference.security` and rely on the pane name in the text. When the app becomes active again, PermissionBroker re-probes automatically.
 6. **Revocation while running**: running taps die or go silent; the lane surfaces this via the normal failure/watchdog paths (Section 8). The next start attempt re-probes and shows the denial state.
-7. **CLI flow**: `tapdeck record …` runs the same probe first. If it cannot be granted (denied, or no GUI session — e.g. SSH), exit with code **2** (permission denied) and print the pane name to stderr.
+7. **CLI flow**: `systemaudiorecorder record …` runs the same probe first. If it cannot be granted (denied, or no GUI session — e.g. SSH), exit with code **2** (permission denied) and print the pane name to stderr.
 
 ### 9.4 PermissionBroker probe design
 
 Public API cannot query TCC state for this service, so `PermissionBroker` **infers** state, with two implementations selected at build time.
 
 **Default: public throwaway-tap probe.**
-- Build a minimal `CATapDescription`: global stereo-mixdown tap excluding TapDeck's own PID, `isPrivate = true`, muteBehavior unmuted.
+- Build a minimal `CATapDescription`: global stereo-mixdown tap excluding System Audio Recorder's own PID, `isPrivate = true`, muteBehavior unmuted.
 - Call `AudioHardwareCreateProcessTap` **on the engine queue, never the main thread** — when the prompt is up, the call can block until the user answers.
 - Result `noErr` + valid tap AudioObjectID → immediately `AudioHardwareDestroyProcessTap` → outcome **granted**. Any error → **notGranted** (the public API cannot distinguish "denied" from "never asked"; the first-ever probe *is* the ask).
 - Cache the last outcome in `UserDefaults` key `permission.audioCapture.lastKnown` (values: `unknown`, `granted`, `notGranted`) so the UI renders state without probing on every launch. A failed probe after a cached `granted` means the user revoked → show the §9.3 denial state.
@@ -907,11 +907,11 @@ Public API cannot query TCC state for this service, so `PermissionBroker` **infe
 
 ### 9.5 Developer/test reset
 
-To re-exercise the prompt during development: `tccutil reset SystemAudioCaptureRequests com.tapdeck.app` (and `tccutil reset SystemAudioCaptureRequests com.tapdeck.cli` for the CLI). Used by the permission tests in Section 10.
+To re-exercise the prompt during development: `tccutil reset SystemAudioCaptureRequests com.systemaudiorecorder.app` (and `tccutil reset SystemAudioCaptureRequests com.systemaudiorecorder.cli` for the CLI). Used by the permission tests in Section 10.
 
 ### 9.6 Entitlements and hardened runtime
 
-One shared entitlements plist, `TapDeck.entitlements`, applied to **both** the app and the CLI at signing time:
+One shared entitlements plist, `SystemAudioRecorder.entitlements`, applied to **both** the app and the CLI at signing time:
 
 | Key | Value | Why |
 |---|---|---|
@@ -919,33 +919,33 @@ One shared entitlements plist, `TapDeck.entitlements`, applied to **both** the a
 | `com.apple.security.app-sandbox` | **absent** (never `true`) | Sandbox is OFF. Background fact: the Process Tap API is fragile/unreliable under the full App Sandbox; known reference implementations ship unsandboxed. |
 | `com.apple.security.get-task-allow` | **absent in Release** | Xcode injects it in Debug signing; notarization rejects it. |
 
-No other entitlements. **Hardened runtime is not an entitlement key** — it is enabled by signing with `--options runtime` (Xcode: "Hardened Runtime" capability ON for every target). TapDeck needs no hardened-runtime exception entitlements (no JIT, no unsigned executable memory, no DYLD variables).
+No other entitlements. **Hardened runtime is not an entitlement key** — it is enabled by signing with `--options runtime` (Xcode: "Hardened Runtime" capability ON for every target). System Audio Recorder needs no hardened-runtime exception entitlements (no JIT, no unsigned executable memory, no DYLD variables).
 
 ### 9.7 Signing, notarization, stapling pipeline
 
-Packaging decision: the CLI ships **inside the app bundle** at `TapDeck.app/Contents/Helpers/tapdeck`; Settings → Advanced offers "Install command-line tool," which symlinks it to `/usr/local/bin/tapdeck` (a symlink does not change code identity, so the TCC grant follows the real binary). Install mechanism: attempt the symlink directly; on `EACCES`/`ENOENT` (missing or root-owned `/usr/local/bin`), run `mkdir -p` + `ln -sf` via an osascript "do shell script … with administrator privileges" prompt; replace any existing symlink; surface failure inline in Settings with the manual one-liner as fallback copy. This yields a single notarized artifact. Pipeline (scripted as `Scripts/notarize.sh`; CI dry-runs it in Phase 0, see Section 12):
+Packaging decision: the CLI ships **inside the app bundle** at `System Audio Recorder.app/Contents/Helpers/systemaudiorecorder`; Settings → Advanced offers "Install command-line tool," which symlinks it to `/usr/local/bin/systemaudiorecorder` (a symlink does not change code identity, so the TCC grant follows the real binary). Install mechanism: attempt the symlink directly; on `EACCES`/`ENOENT` (missing or root-owned `/usr/local/bin`), run `mkdir -p` + `ln -sf` via an osascript "do shell script … with administrator privileges" prompt; replace any existing symlink; surface failure inline in Settings with the manual one-liner as fallback copy. This yields a single notarized artifact. Pipeline (scripted as `Scripts/notarize.sh`; CI dry-runs it in Phase 0, see Section 12):
 
-1. **One-time setup**: install the "Developer ID Application: \<Name\> (\<TEAMID\>)" certificate; store notary credentials once: `xcrun notarytool store-credentials TapDeckNotary` (App Store Connect API key or Apple ID + app-specific password).
+1. **One-time setup**: install the "Developer ID Application: \<Name\> (\<TEAMID\>)" certificate; store notary credentials once: `xcrun notarytool store-credentials SystemAudioRecorderNotary` (App Store Connect API key or Apple ID + app-specific password).
 2. Build Release configuration of all targets.
-3. **Sign inside-out, never `--deep`**: first the nested CLI — `codesign --force --timestamp --options runtime --entitlements TapDeck.entitlements --sign "Developer ID Application: …" TapDeck.app/Contents/Helpers/tapdeck` — then any other nested code, then the app bundle itself with the same flags. Note: `TapKit` is *statically linked* (Section 4.1), so there is no embedded framework to sign in v1; if the layout ever changes to an embedded `TapKit.framework`, sign it between the CLI and the outer app (frameworks get `--timestamp --options runtime` but **no** entitlements plist). Sparkle, if Phase 9 adds it, is nested code signed per its own documentation at this same step.
-4. Local verify: `codesign --verify --strict --verbose=2 TapDeck.app` and `codesign -d --entitlements - TapDeck.app` (confirm exactly the §9.6 set, no `get-task-allow`).
-5. Zip for submission: `ditto -c -k --keepParent TapDeck.app TapDeck.zip` (ditto preserves the metadata notarization requires).
-6. `xcrun notarytool submit TapDeck.zip --keychain-profile TapDeckNotary --wait`. On "Invalid," run `xcrun notarytool log <submission-id> --keychain-profile TapDeckNotary` and fix.
-7. `xcrun stapler staple TapDeck.app` (staple the .app — the zip cannot be stapled).
-8. Build the distribution DMG from the stapled app (`hdiutil create`), `codesign --sign "Developer ID Application: …" TapDeck.dmg`, submit the DMG through notarytool the same way, then `xcrun stapler staple TapDeck.dmg`.
-9. Gates: `stapler validate TapDeck.app`, `stapler validate TapDeck.dmg`, `spctl -a -vv -t install TapDeck.dmg` must pass; then a clean-machine (or fresh-VM) Gatekeeper first-open test.
+3. **Sign inside-out, never `--deep`**: first the nested CLI — `codesign --force --timestamp --options runtime --entitlements SystemAudioRecorder.entitlements --sign "Developer ID Application: …" System Audio Recorder.app/Contents/Helpers/systemaudiorecorder` — then any other nested code, then the app bundle itself with the same flags. Note: `TapKit` is *statically linked* (Section 4.1), so there is no embedded framework to sign in v1; if the layout ever changes to an embedded `TapKit.framework`, sign it between the CLI and the outer app (frameworks get `--timestamp --options runtime` but **no** entitlements plist). Sparkle, if Phase 9 adds it, is nested code signed per its own documentation at this same step.
+4. Local verify: `codesign --verify --strict --verbose=2 System Audio Recorder.app` and `codesign -d --entitlements - System Audio Recorder.app` (confirm exactly the §9.6 set, no `get-task-allow`).
+5. Zip for submission: `ditto -c -k --keepParent System Audio Recorder.app System Audio Recorder.zip` (ditto preserves the metadata notarization requires).
+6. `xcrun notarytool submit System Audio Recorder.zip --keychain-profile SystemAudioRecorderNotary --wait`. On "Invalid," run `xcrun notarytool log <submission-id> --keychain-profile SystemAudioRecorderNotary` and fix.
+7. `xcrun stapler staple System Audio Recorder.app` (staple the .app — the zip cannot be stapled).
+8. Build the distribution DMG from the stapled app (`hdiutil create`), `codesign --sign "Developer ID Application: …" System Audio Recorder.dmg`, submit the DMG through notarytool the same way, then `xcrun stapler staple System Audio Recorder.dmg`.
+9. Gates: `stapler validate System Audio Recorder.app`, `stapler validate System Audio Recorder.dmg`, `spctl -a -vv -t install System Audio Recorder.dmg` must pass; then a clean-machine (or fresh-VM) Gatekeeper first-open test.
 
 The standalone CLI needs no separate submission — it rides inside the notarized app bundle and its own signature was covered in step 3.
 
 ### 9.8 Why the Mac App Store is off the table
 
-MAS mandates the App Sandbox with no opt-out, and it is an established fact (background) that the Process Tap API is fragile/unreliable under the full sandbox — the core capture feature cannot ship that way. Further frictions stack on top: user-chosen recording folders, the `/usr/local/bin` symlink, user shell hooks (Section 3), and optional Sparkle self-updates are all sandbox-hostile. Developer ID + notarization delivers a Gatekeeper-clean install without capping the product, so no design effort goes to a MAS variant. (TapDeck is a working title; renaming touches only bundle ids, the usage string, and signing config.)
+MAS mandates the App Sandbox with no opt-out, and it is an established fact (background) that the Process Tap API is fragile/unreliable under the full sandbox — the core capture feature cannot ship that way. Further frictions stack on top: user-chosen recording folders, the `/usr/local/bin` symlink, user shell hooks (Section 3), and optional Sparkle self-updates are all sandbox-hostile. Developer ID + notarization delivers a Gatekeeper-clean install without capping the product, so no design effort goes to a MAS variant. (System Audio Recorder is a working title; renaming touches only bundle ids, the usage string, and signing config.)
 
 ---
 
 ## 10. Testing & Validation Plan
 
-Test framework: **XCTest** for all Swift/C unit tests (the `TapDeckRT` C library is tested through a thin Swift wrapper target). CI (macOS 14.4+ runner) runs 10.1–10.2 on every commit. Everything from 10.3 onward needs live audio hardware and a TCC grant, so those are **manual/dedicated-Mac procedures**. Tooling split: the automated diagnostics ship as hidden `tapdeck diag` subcommands — asset generation (`gen-null-asset`, 10.3), `filecheck` (10.2), and `nulltest` (10.3) — so they run without Xcode; the Bug-B soak (10.5) is a shell script (`scripts/soak.sh`) driving the normal CLI, and the permission flow (10.6) and crash-kill recovery (10.7) are manual checklist/harness procedures.
+Test framework: **XCTest** for all Swift/C unit tests (the `SystemAudioRecorderRT` C library is tested through a thin Swift wrapper target). CI (macOS 14.4+ runner) runs 10.1–10.2 on every commit. Everything from 10.3 onward needs live audio hardware and a TCC grant, so those are **manual/dedicated-Mac procedures**. Tooling split: the automated diagnostics ship as hidden `systemaudiorecorder diag` subcommands — asset generation (`gen-null-asset`, 10.3), `filecheck` (10.2), and `nulltest` (10.3) — so they run without Xcode; the Bug-B soak (10.5) is a shell script (`scripts/soak.sh`) driving the normal CLI, and the permission flow (10.6) and crash-kill recovery (10.7) are manual checklist/harness procedures.
 
 ### 10.1 Unit tests
 
@@ -964,7 +964,7 @@ Goal: prove the SPSC ring (see §5) delivers a byte-exact stream across wrap bou
 
 1. Zeros for 5 s → state `SUSPICIOUS`; a single nonzero sample on any channel → back to `NORMAL`, zero-run reset to 0.
 2. Zeros ≥ 10 s AND corroboration reports "audio expected" for 3 consecutive 1 Hz polls → `CONFIRMED_DROPOUT` → exactly one rebuild invocation.
-3. **Genuine-silence-forever (the critical no-rebuild case):** zeros for a simulated **6 hours** with corroboration always reporting "no non-TapDeck process outputting audio." Assert: state remains `SUSPICIOUS` for the whole run, rebuild executor invoked **0 times**, no `zeroDropoutRebuild` manifest event emitted.
+3. **Genuine-silence-forever (the critical no-rebuild case):** zeros for a simulated **6 hours** with corroboration always reporting "no non-System Audio Recorder process outputting audio." Assert: state remains `SUSPICIOUS` for the whole run, rebuild executor invoked **0 times**, no `zeroDropoutRebuild` manifest event emitted.
 4. Corroboration reads throw errors → uncorroborated fallback rebuild fires at zero-run ≥ 60 s, not before.
 5. Rebuild verify-failure loop: post-rebuild corroborated zeros persist ≥ 10 s → next attempt. Assert the simulated delay before each attempt matches §8's per-episode schedule exactly: **0.5 s before attempt 1, 2 s before attempt 2, 5 s before attempt 3**. Hard cap **3 attempts per 10-minute window**: the **3rd failed attempt** inside the window → `ESCALATED` (never a 4th backoff attempt); in `ESCALATED`, retries occur every 60 s (the 60 s cadence replaces the 0.5/2/5 s schedule, §8) and exactly one user notification is posted.
 6. Nonzero arriving mid-`POST_REBUILD_VERIFY` → `NORMAL`. Attempt bookkeeping per §8: the per-episode backoff numbering resets (a later episode's first attempt gets the 0.5 s delay again), but consumed attempts keep their wall-clock timestamps in the sliding 10-minute window. Assert both halves: (a) after 2 failed attempts, nonzero → `NORMAL`, and a new dropout episode 1 simulated minute later rebuilds with a 0.5 s backoff; (b) when that new episode's first attempt also fails verify, the watchdog enters `ESCALATED` — the window now holds 3 failed attempts; (c) the same sequence re-run with the second episode starting 11 simulated minutes later does NOT escalate on its first failure (the earlier attempts aged out of the window).
@@ -979,13 +979,13 @@ Test the session-folder template expander (§6) with all tokens `{date} {time} {
 
 ### 10.2 File-layer bit-exact self-test
 
-Guards against the float→Int32 WAV-class truncation bug ever reappearing in the master path (§6). Runs automatically at every app and CLI launch in **all builds** (not debug-only); on any mismatch, TapDeck refuses to record until the check passes. The hidden diagnostic `tapdeck diag filecheck` is the manual entry point for the same check (§6.2 is canonical for this behavior).
+Guards against the float→Int32 WAV-class truncation bug ever reappearing in the master path (§6). Runs automatically at every app and CLI launch in **all builds** (not debug-only); on any mismatch, System Audio Recorder refuses to record until the check passes. The hidden diagnostic `systemaudiorecorder diag filecheck` is the manual entry point for the same check (§6.2 is canonical for this behavior).
 
 Procedure: generate exactly 1 s of stereo Float32 at 48 kHz whose sample values are raw LCG bit patterns (seed 0x54415044) reinterpreted as Float32, NaN patterns skipped — deliberately including denormals, −0.0, and magnitudes > 1.0. Write through `SegmentWriter` (identical client/file ASBDs, §6) to a temp CAF; read back with ExtAudioFile using the same ASBD; `memcmp` the raw byte buffers. Pass: byte-identical, read-back frame count exactly 48,000. Any difference is a hard failure.
 
 ### 10.3 Null-test methodology (fidelity validation — canonical procedure)
 
-This is the ground-truth fidelity check. **Playback MAY use AVFoundation (AVAudioPlayer); the capture path NEVER does** — capture is always the raw IOProc path (§4, §5). The procedure is automated as `tapdeck diag nulltest [--device <uid>]`; the steps below are its specification.
+This is the ground-truth fidelity check. **Playback MAY use AVFoundation (AVAudioPlayer); the capture path NEVER does** — capture is always the raw IOProc path (§4, §5). The procedure is automated as `systemaudiorecorder diag nulltest [--device <uid>]`; the steps below are its specification.
 
 **Test asset composition** — one continuous 60 s Float32 stereo interleaved CAF, identical signal on both channels, generated at the **target device's current nominal sample rate** at test time (never a fixed shipped rate — a rate mismatch triggers OS resampling and invalidates the test, §7). Segments are sample-accurate, butt-joined, no crossfades:
 
@@ -1001,7 +1001,7 @@ This is the ground-truth fidelity check. **Playback MAY use AVFoundation (AVAudi
 
 1. Pick a true **2-channel** output device (built-in speakers or headphone out) — this excludes Bug A from the measurement. Record device UID, channel count, nominal rate, macOS build.
 2. Set it as system default output at 100% volume (removes the unresolved pre-/post-volume question, §11, as a variable). Warn the operator it will be audible; headphones recommended.
-3. Generate the asset at the device's current rate: `tapdeck diag gen-null-asset --out nulltest-source.caf`.
+3. Generate the asset at the device's current rate: `systemaudiorecorder diag gen-null-asset --out nulltest-source.caf`.
 4. Start capture via the normal TapKit path: system-mix source, default device, default settings (stereo mixdown, unmuted).
 5. Wait 2 s (lead-in), then play `nulltest-source.caf` once via **AVAudioPlayer**.
 6. After playback ends, wait 2 s (tail); stop and finalize the session.
@@ -1012,14 +1012,14 @@ This is the ground-truth fidelity check. **Playback MAY use AVFoundation (AVAudi
 11. Per segment, trim a **250 ms guard** at both boundaries (keeps OS-filter transition ringing out of neighboring segments), then compute residual RMS (dBFS) and peak.
 12. Assert the silence segment's captured **interior is exactly zero** — every sample bit-equal to ±0.0, not merely low RMS.
 13. Evaluate against the expectations table below.
-14. **Baseline & regression:** on first run for a given (machine, deviceUID, macOS build), write all per-segment residuals to `~/Library/Application Support/TapDeck/diagnostics/nulltest-baseline.json`. Later runs flag any segment residual RMS deviating more than **±1.5 dB** from baseline as a regression (nonzero exit, red report line).
+14. **Baseline & regression:** on first run for a given (machine, deviceUID, macOS build), write all per-segment residuals to `~/Library/Application Support/System Audio Recorder/diagnostics/nulltest-baseline.json`. Later runs flag any segment residual RMS deviating more than **±1.5 dB** from baseline as a regression (nonzero exit, red report line).
 
 **Expected residuals (research baseline — these are OS facts, not tunables):**
 
 | Segment | Expected residual RMS | Verdict rule |
 |---|---|---|
 | 997 Hz sine | **≤ −70 dBFS** | Hard pass/fail gate |
-| 200 Hz square | **≈ −3 dBFS** (research measured −2.9 dBFS; capture peak reads ~+2 dB high) | **EXPECTED — this is Apple's non-optional ingestion reconstruction filter (Gibbs ringing). It is NOT a TapDeck defect; do not attempt to "fix" it.** Gate only via baseline ±1.5 dB |
+| 200 Hz square | **≈ −3 dBFS** (research measured −2.9 dBFS; capture peak reads ~+2 dB high) | **EXPECTED — this is Apple's non-optional ingestion reconstruction filter (Gibbs ringing). It is NOT a System Audio Recorder defect; do not attempt to "fix" it.** Gate only via baseline ±1.5 dB |
 | Log sweep | No absolute gate; record to baseline (HF end shows filter deviation) | Baseline ±1.5 dB |
 | Silence | **Exactly zero** | Hard gate (step 12) |
 | Pink noise | No absolute gate; record to baseline | Baseline ±1.5 dB |
@@ -1032,14 +1032,14 @@ On a Mac with a >2-output-channel device (hardware interface, or a stand-in mult
 
 ### 10.5 Bug-B 24-hour soak
 
-Run `tapdeck record --system` for 24 h on a dedicated Mac, driven by `scripts/soak.sh`: repeating cycle of 25 min pink-noise playback (`afplay` loop) + 5 min silence, **except a scripted 2-hour genuine-silence window at hours 12–14 with zero playback**. Assertions from the finalized manifest and logs: (a) **zero `zeroDropoutRebuild` events inside the 2 h silence window** — any rebuild there is a watchdog false positive and a release blocker; (b) if the dropout bug fires during playback windows, every rebuild recovers within **15 s** (`gapMs ≤ 15000`) with a well-formed manifest event; (c) never firing is also a pass (bug absent on this build — keep the watchdog regardless, §8); (d) no `overrunGap` events; (e) process RSS growth < 10% between hour 1 and hour 24; (f) the session finalizes cleanly and every segment reads to its stated frame count.
+Run `systemaudiorecorder record --system` for 24 h on a dedicated Mac, driven by `scripts/soak.sh`: repeating cycle of 25 min pink-noise playback (`afplay` loop) + 5 min silence, **except a scripted 2-hour genuine-silence window at hours 12–14 with zero playback**. Assertions from the finalized manifest and logs: (a) **zero `zeroDropoutRebuild` events inside the 2 h silence window** — any rebuild there is a watchdog false positive and a release blocker; (b) if the dropout bug fires during playback windows, every rebuild recovers within **15 s** (`gapMs ≤ 15000`) with a well-formed manifest event; (c) never firing is also a pass (bug absent on this build — keep the watchdog regardless, §8); (d) no `overrunGap` events; (e) process RSS growth < 10% between hour 1 and hour 24; (f) the session finalizes cleanly and every segment reads to its stated frame count.
 
 ### 10.6 Permission-flow tests (manual checklist)
 
-1. `tccutil reset SystemAudioCaptureRequests com.tapdeck.app` → launch → onboarding sheet → "Enable System Audio Capture" → system prompt attributed to TapDeck → grant → a 5 s recording succeeds.
+1. `tccutil reset SystemAudioCaptureRequests com.systemaudiorecorder.app` → launch → onboarding sheet → "Enable System Audio Capture" → system prompt attributed to System Audio Recorder → grant → a 5 s recording succeeds.
 2. Reset again → **deny** → app shows the denial state; its button opens System Settings → Privacy & Security → Screen & System Audio Recording (verify the §9 deep-link anchor lands; log if not — open risk).
 3. Grant manually in System Settings → return to app → probe succeeds without relaunch.
-4. CLI separately (own grant, §1/§9): `tccutil reset SystemAudioCaptureRequests com.tapdeck.cli` → `tapdeck record --system --duration 5` → prompt attributed to the CLI; denial exits with code **2**.
+4. CLI separately (own grant, §1/§9): `tccutil reset SystemAudioCaptureRequests com.systemaudiorecorder.cli` → `systemaudiorecorder record --system --duration 5` → prompt attributed to the CLI; denial exits with code **2**.
 5. If built with `PRIVATE_TCC_PROBE`: the exact-status probe must agree with observed prompt behavior; the default-OFF build must not link the SPI (`nm` check in CI).
 
 ### 10.7 Large-file and crash-recovery tests
@@ -1084,19 +1084,19 @@ This register aggregates every "verify hands-on" flag from Sections 4–10. Each
 - *Fallback*: flip the single dictionary constant to `false` in TapFactory's recipe (Section 4).
 
 **R6 — `matchDeviceLayout` (unmixed) channel behavior. RETIRED — feature removed.**
-- `matchDeviceLayout` and the per-app (`.appSet`) capture mode it belonged to were removed entirely (Section 3.4): the only tap TapDeck builds now is `CATapDescription(stereoGlobalTapButExcludeProcesses:)`, whose channel behavior is already exercised by the Section 10.3 null test. Nothing in the shipped design depends on the unmixed per-process tap variant anymore.
+- `matchDeviceLayout` and the per-app (`.appSet`) capture mode it belonged to were removed entirely (Section 3.4): the only tap System Audio Recorder builds now is `CATapDescription(stereoGlobalTapButExcludeProcesses:)`, whose channel behavior is already exercised by the Section 10.3 null test. Nothing in the shipped design depends on the unmixed per-process tap variant anymore.
 
 **R7 — DRM capture works incidentally.**
 - *Risk*: taps currently capture decoded PCM from FairPlay-protected sources (Apple Music, Netflix, Apple TV+); empirical, not an Apple guarantee, and could stop working in any release.
 - *Why unresolved*: depends on Apple's protected-path implementation, outside our control.
 - *Verify*: hands-on, private testing only — play a protected source during capture and inspect the result.
-- *Legal/ToS note (binding)*: recording protected content may violate service terms or law regardless of feasibility. TapDeck must never target, advertise, special-case, or attempt to circumvent DRM; no product copy mentions protected services. If the OS ever zeroes protected audio it will look like Bug B: corroborated zeros → up to 3 rebuilds → ESCALATED (Section 8). Acceptable — but the ESCALATED notification copy must not promise recovery.
+- *Legal/ToS note (binding)*: recording protected content may violate service terms or law regardless of feasibility. System Audio Recorder must never target, advertise, special-case, or attempt to circumvent DRM; no product copy mentions protected services. If the OS ever zeroes protected audio it will look like Bug B: corroborated zeros → up to 3 rebuilds → ESCALATED (Section 8). Acceptable — but the ESCALATED notification copy must not promise recovery.
 
 **R8 — App Intents in an `LSUIElement` app.**
 - *Risk*: Shortcuts discovery/execution of intents in menu-bar-only apps has historically been unreliable (intents missing until first launch, or requiring the app running).
 - *Why unresolved*: discovery behavior varies by macOS release.
 - *Verify*: Phase 8 — fresh install; check Start Recording / Stop Recording / Get Recording Status appear in Shortcuts before first launch, and that invoking them launches the app.
-- *Fallback*: the `tapdeck://` URL scheme and CLI (Section 3) already cover automation; ship intents best-effort and document "open TapDeck once after installing" if needed.
+- *Fallback*: the `systemaudiorecorder://` URL scheme and CLI (Section 3) already cover automation; ship intents best-effort and document "open System Audio Recorder once after installing" if needed.
 
 **R9 — Sparkle optionality.**
 - *Risk*: Sparkle 2 is the only third-party dependency and only in Phase 9; under hardened runtime its embedded helpers must be signed/notarized correctly, enlarging the pipeline surface (Section 9).
@@ -1105,9 +1105,9 @@ This register aggregates every "verify hands-on" flag from Sections 4–10. Each
 - *Fallback*: ship v1 without auto-update; a "Check for Updates…" menu item opens the releases page. Nothing else depends on Sparkle.
 
 **R10 — CLI TCC attribution and headless contexts.**
-- *Risk*: the CLI's prompt must attribute to `com.tapdeck.cli` via its embedded Info.plist (not to Terminal); and no prompt can appear at all without a GUI session (SSH, launchd).
+- *Risk*: the CLI's prompt must attribute to `com.systemaudiorecorder.cli` via its embedded Info.plist (not to Terminal); and no prompt can appear at all without a GUI session (SSH, launchd).
 - *Why unresolved*: responsible-process attribution rules for this TCC service are undocumented.
-- *Verify*: Phase 1 — on clean TCC state, run `tapdeck record` from Terminal; confirm the prompt names "tapdeck" and a separate Settings row appears. Repeat over SSH; expect failure.
+- *Verify*: Phase 1 — on clean TCC state, run `systemaudiorecorder record` from Terminal; confirm the prompt names "systemaudiorecorder" and a separate Settings row appears. Repeat over SSH; expect failure.
 - *Fallback*: for the headless case, exit code 2 with stderr instructions (Section 9); document that the first CLI grant must happen in a GUI session. For the misattribution case: if the grant attributes to the containing app, accept the single shared grant and simplify §9.2's two-grant description; if it attributes to the invoking terminal, document that the CLI must be launched directly (not through a shell wrapper that re-execs) and revisit the embedded-plist attribution with Apple's current rules.
 
 **R11 — `PRIVATE_TCC_PROBE` SPI drift.**
@@ -1131,7 +1131,7 @@ Ordering principle: **the riskiest OS-dependent facts are proven first (Phase 1)
 ### Phase 0 — Project skeleton & signing pipeline
 
 Tasks:
-- Create one Xcode project with the four targets from §2: `TapDeckRT` (C static library), `TapKit` (framework), `TapDeckApp` (app, bundle id `com.tapdeck.app`), `tapdeck` (CLI, bundle id `com.tapdeck.cli` via `__info_plist` linker section). Deployment target macOS 14.4.
+- Create one Xcode project with the four targets from §2: `SystemAudioRecorderRT` (C static library), `TapKit` (framework), `SystemAudioRecorderApp` (app, bundle id `com.systemaudiorecorder.app`), `systemaudiorecorder` (CLI, bundle id `com.systemaudiorecorder.cli` via `__info_plist` linker section). Deployment target macOS 14.4.
 - Type `NSAudioCaptureUsageDescription` manually into both Info.plists (exact string in §9 — the key is absent from Xcode's dropdown).
 - Entitlements plist per §9.6 (audio-input entitlement; no sandbox key — see also Open Risks §11); enable Hardened Runtime as a signing option (`--options runtime` / the Xcode capability) on every target — it is not an entitlements-plist key.
 - CI job: build both executables, `codesign` with the Developer ID identity + entitlements, `xcrun notarytool submit` a zipped stub app, `xcrun stapler staple` — the full pipeline on a do-nothing binary.
@@ -1147,19 +1147,19 @@ Tasks:
 - In the CLI only, hardcode the full §4 creation recipe: global tap (`CATapDescription`, excluding own PID) → `AudioHardwareCreateProcessTap` → private aggregate device (exact composition dictionary from §4) → `AudioDeviceCreateIOProcIDWithBlock` (NULL queue) → `AudioDeviceStart`.
 - Read `kAudioTapPropertyFormat`; write 10 s straight to a CAF via ExtAudioFile with identical client/file ASBDs. (Spike may write from a plain callback-fed buffer; the real ring arrives in Phase 2.)
 - Implement the strict teardown order (§8) on exit.
-- Exercise the TCC prompt for `com.tapdeck.cli`.
+- Exercise the TCC prompt for `com.systemaudiorecorder.cli`.
 
-Deliverable: `tapdeck` records 10 s of whatever the Mac is playing to `spike.caf`.
+Deliverable: `systemaudiorecorder` records 10 s of whatever the Mac is playing to `spike.caf`.
 
-DONE WHEN: on a machine after `tccutil reset SystemAudioCaptureRequests com.tapdeck.cli`, running the spike triggers the system permission prompt; after granting, the produced CAF plays in QuickTime Player and audibly contains the source material; `afinfo` reports Float32 at the output device's current nominal rate. This gate de-risks the entire product — do not proceed past it with workarounds.
+DONE WHEN: on a machine after `tccutil reset SystemAudioCaptureRequests com.systemaudiorecorder.cli`, running the spike triggers the system permission prompt; after granting, the produced CAF plays in QuickTime Player and audibly contains the source material; `afinfo` reports Float32 at the output device's current nominal rate. This gate de-risks the entire product — do not proceed past it with workarounds.
 
 ### Phase 2 — TapKit core: ring, lanes, writer
 
 Tasks:
-- Implement `td_ring_t` in `TapDeckRT` per §5 (SPSC, C11 atomics, cache-line-separated indices, drop-all-or-nothing) + the real-time C capture context.
+- Implement `td_ring_t` in `SystemAudioRecorderRT` per §5 (SPSC, C11 atomics, cache-line-separated indices, drop-all-or-nothing) + the real-time C capture context.
 - Implement `TapFactory`, `IOProcHost`, `DrainLoop` (50 ms cycle, zero-scan, vDSP meters, interleave, synchronous write), `SegmentWriter` (CAF `-1` size chunk, finalize patch), the §8 lane state machine (`IDLE→PREPARING→RUNNING→STOPPING→FINALIZING`, `FAILED`), `CaptureEngine` with the engine queue, `SessionStore` manifest v1 write + launch recovery scan. SessionStore is built in Phase 2 — deliberately pulled forward from the spine's Phase 5 — because Phase 3's manifest events and Phase 2's crash-recovery gate depend on it.
 - Read device nominal rate at lane start (§7); wire the CLI `record --system` verb onto TapKit.
-- Implement the bit-exact self-test and `tapdeck diag filecheck` (10.2).
+- Implement the bit-exact self-test and `systemaudiorecorder diag filecheck` (10.2).
 
 Deliverable: production-path CLI recorder producing session folders with `session.json`.
 
@@ -1178,13 +1178,13 @@ DONE WHEN: the full watchdog simulation suite passes, **including the genuine-si
 
 ### Phase 4 — Per-app capture & multi-track (historical — later removed)
 
-Tasks: full `ProcessCatalog` (§4 property constants, 1 Hz gated polling); `SessionSpec` `.appSet` sources (single mixed tap for multiple apps; one-lane-per-app when `multiTrack=true`); bundle-id AppSelectors surviving relaunch; per-lane folders/slugs; `mHostTime`-based cross-lane alignment in the manifest; CLI `--app`/`--multitrack`/`tapdeck apps`.
+Tasks: full `ProcessCatalog` (§4 property constants, 1 Hz gated polling); `SessionSpec` `.appSet` sources (single mixed tap for multiple apps; one-lane-per-app when `multiTrack=true`); bundle-id AppSelectors surviving relaunch; per-lane folders/slugs; `mHostTime`-based cross-lane alignment in the manifest; CLI `--app`/`--multitrack`/`systemaudiorecorder apps`.
 
 Deliverable: CLI can record one app, several apps mixed, or several apps as separate tracks.
 
 DONE WHEN: recording `com.apple.Music` while a second app plays captures ONLY Music (the other app is absent by ear and by meter); a two-app multitrack session produces two lane folders whose first-buffer host times align the tracks within ±10 ms when loaded into a DAW.
 
-**Post-v1 note:** per-app capture and multi-track (`.appSet`, `AppSelector`, `SessionSpecPlanner`/`LanePlan`, CLI `--app`/`--multitrack`) were removed after this phase shipped — a global tap already captures whatever is playing, and maintaining per-app isolation as a second capture path wasn't worth the surface area (Section 3.4). `ProcessCatalog` and `tapdeck apps` remain, now serving only the exclusion-list editor and app-activity triggers.
+**Post-v1 note:** per-app capture and multi-track (`.appSet`, `AppSelector`, `SessionSpecPlanner`/`LanePlan`, CLI `--app`/`--multitrack`) were removed after this phase shipped — a global tap already captures whatever is playing, and maintaining per-app isolation as a second capture path wasn't worth the surface area (Section 3.4). `ProcessCatalog` and `systemaudiorecorder apps` remain, now serving only the exclusion-list editor and app-activity triggers.
 
 ### Phase 5 — GUI app: menu bar, onboarding, Library
 
@@ -1196,7 +1196,7 @@ DONE WHEN: the full permission checklist (10.6, app portion) passes from a `tccu
 
 ### Phase 6 — ExportService
 
-Tasks: transcodes from the CAF master only (§6): FLAC 16/24, ALAC 16/24, AAC ~256 kbps VBR, WAV 24-bit (compatibility-only copy in UI); TPDF dither default-ON for 16-bit; optional gain compensation hook (profile applied in Phase 7); Library export panel + `tapdeck export` verb; honest "lossless" labeling copy (§6); exports carry basic metadata from `session.json` (session title, date, source app/device) written via the container's standard tags.
+Tasks: transcodes from the CAF master only (§6): FLAC 16/24, ALAC 16/24, AAC ~256 kbps VBR, WAV 24-bit (compatibility-only copy in UI); TPDF dither default-ON for 16-bit; optional gain compensation hook (profile applied in Phase 7); Library export panel + `systemaudiorecorder export` verb; honest "lossless" labeling copy (§6); exports carry basic metadata from `session.json` (session title, date, source app/device) written via the container's standard tags.
 
 Deliverable: shareable files in every supported format.
 
@@ -1204,7 +1204,7 @@ DONE WHEN: each format decodes and matches the master's duration/frame count; FL
 
 ### Phase 7 — CalibrationService & Bug-A UX
 
-Tasks: consent dialog → play 997 Hz sine at −20 dBFS for 5 s through the target device via a temporary lane → measure middle-3 s RMS → store `gainCompensationDB` profile keyed `(deviceUID, outputChannelCount, macOSBuild)` (§8); >2-channel heuristic badge; compensated meters with "cal" badge; export-time compensation toggle; "Bake into master" advanced setting default OFF; `tapdeck calibrate` + Bug-A risk flag in `tapdeck devices`.
+Tasks: consent dialog → play 997 Hz sine at −20 dBFS for 5 s through the target device via a temporary lane → measure middle-3 s RMS → store `gainCompensationDB` profile keyed `(deviceUID, outputChannelCount, macOSBuild)` (§8); >2-channel heuristic badge; compensated meters with "cal" badge; export-time compensation toggle; "Bake into master" advanced setting default OFF; `systemaudiorecorder calibrate` + Bug-A risk flag in `systemaudiorecorder devices`.
 
 Deliverable: measured, per-device level trust.
 
@@ -1212,7 +1212,7 @@ DONE WHEN: the Bug-A test (10.4) passes: 2-channel calibration within ±0.5 dB o
 
 ### Phase 8 — Automation surface
 
-Tasks: all CLI verbs + exit codes from §3; URL scheme (`tapdeck://record/start|stop`); App Intents (Start/Stop/Get Status); shell hooks (`onSessionStart`, `onSegmentClose`, `onSessionFinalize` with `TAPDECK_*` env vars, 30 s timeout); `TriggerEngine` schedules + app-activity auto-record (1 Hz, `hangTime` 10 s, document the ~1 s lead-in limitation); `HotkeyCenter` (default ⌃⌥⌘R).
+Tasks: all CLI verbs + exit codes from §3; URL scheme (`systemaudiorecorder://record/start|stop`); App Intents (Start/Stop/Get Status); shell hooks (`onSessionStart`, `onSegmentClose`, `onSessionFinalize` with `SYSTEMAUDIORECORDER_*` env vars, 30 s timeout); `TriggerEngine` schedules + app-activity auto-record (1 Hz, `hangTime` 10 s, document the ~1 s lead-in limitation); `HotkeyCenter` (default ⌃⌥⌘R).
 
 Deliverable: fully scriptable recorder.
 
@@ -1220,7 +1220,7 @@ DONE WHEN: a scripted matrix exercises every CLI verb and asserts documented exi
 
 ### Phase 9 — Hardening & ship
 
-Tasks: run the full Section 10 battery — null test with baseline capture (10.3), Bug-A test (10.4), 24 h Bug-B soak with the 2 h silence window (10.5), permission matrix (10.6), 4 GB+ and crash tests (10.7); re-verify every still-open "verify hands-on" item in §11 on the current macOS build (Bug A/Bug B presence, mic entitlement, settings deep-link anchor, DRM behavior — R6 is retired, Section 11); finalize the notarization pipeline on a DMG; optional Sparkle 2 integration; write user docs + the diagnostics guide (`tapdeck diag`).
+Tasks: run the full Section 10 battery — null test with baseline capture (10.3), Bug-A test (10.4), 24 h Bug-B soak with the 2 h silence window (10.5), permission matrix (10.6), 4 GB+ and crash tests (10.7); re-verify every still-open "verify hands-on" item in §11 on the current macOS build (Bug A/Bug B presence, mic entitlement, settings deep-link anchor, DRM behavior — R6 is retired, Section 11); finalize the notarization pipeline on a DMG; optional Sparkle 2 integration; write user docs + the diagnostics guide (`systemaudiorecorder diag`).
 
 Deliverable: the notarized, distributable release.
 

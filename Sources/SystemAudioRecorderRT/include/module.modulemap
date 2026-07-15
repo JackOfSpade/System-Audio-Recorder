@@ -1,4 +1,4 @@
-module TapDeckRT {
+module SystemAudioRecorderRT {
     header "td_ring.h"
     export *
 }

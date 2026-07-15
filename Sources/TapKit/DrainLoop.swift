@@ -1,5 +1,5 @@
 import Accelerate
-import TapDeckRT
+import SystemAudioRecorderRT
 import Foundation
 
 /// Per-channel peak+RMS meters plus clip/zero-run state, published to the UI
@@ -106,7 +106,7 @@ public final class DrainLoop {
     public func start() {
         let t = Thread { [weak self] in self?.runLoop() }
         t.qualityOfService = .userInitiated
-        t.name = "com.tapdeck.drainloop"
+        t.name = "com.systemaudiorecorder.drainloop"
         thread = t
         t.start()
     }
@@ -230,7 +230,7 @@ public final class DrainLoop {
                 }
             }
         } catch {
-            FileHandle.standardError.write("TapDeck: segment write failed: \(error)\n".data(using: .utf8)!)
+            FileHandle.standardError.write("System Audio Recorder: segment write failed: \(error)\n".data(using: .utf8)!)
         }
         framePosition += Int64(frameCount)
 

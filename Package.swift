@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "TapDeck",
+    name: "SystemAudioRecorder",
     platforms: [
         // Section 1/9: the Process Tap API requires macOS 14.2+; the design's
         // stated minimum deployment target is 14.4.
@@ -10,16 +10,17 @@ let package = Package(
     ],
     products: [
         // TapKit is intentionally NOT exposed as a product: it's consumed
-        // only by tapdeck/TapDeckApp/TapKitTests within this same package.
-        .executable(name: "tapdeck", targets: ["tapdeck"]),
-        .executable(name: "TapDeckApp", targets: ["TapDeckApp"])
+        // only by systemaudiorecorder/SystemAudioRecorderApp/TapKitTests
+        // within this same package.
+        .executable(name: "systemaudiorecorder", targets: ["systemaudiorecorder"]),
+        .executable(name: "SystemAudioRecorderApp", targets: ["SystemAudioRecorderApp"])
     ],
     targets: [
         // C11 static library: lock-free SPSC ring buffer + real-time capture context.
         // Depends on libc only. No Swift runtime anywhere near this target.
         .target(
-            name: "TapDeckRT",
-            path: "Sources/TapDeckRT",
+            name: "SystemAudioRecorderRT",
+            path: "Sources/SystemAudioRecorderRT",
             publicHeadersPath: "include",
             cSettings: [
                 .unsafeFlags(["-std=c11"])
@@ -29,7 +30,7 @@ let package = Package(
         // All capture, device, file, watchdog, export, and trigger logic. No UI imports.
         .target(
             name: "TapKit",
-            dependencies: ["TapDeckRT"],
+            dependencies: ["SystemAudioRecorderRT"],
             path: "Sources/TapKit",
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
@@ -44,9 +45,9 @@ let package = Package(
         // Info.plist is consumed via the __info_plist linker section (Section 9.1),
         // not as a SwiftPM resource, so it's excluded from resource processing.
         .executableTarget(
-            name: "tapdeck",
+            name: "systemaudiorecorder",
             dependencies: ["TapKit"],
-            path: "Sources/tapdeck",
+            path: "Sources/systemaudiorecorder",
             exclude: ["Info.plist"],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
@@ -54,7 +55,7 @@ let package = Package(
                     "-Xlinker", "-sectcreate",
                     "-Xlinker", "__TEXT",
                     "-Xlinker", "__info_plist",
-                    "-Xlinker", "Sources/tapdeck/Info.plist"
+                    "-Xlinker", "Sources/systemaudiorecorder/Info.plist"
                 ])
             ]
         ),
@@ -64,9 +65,9 @@ let package = Package(
         // Xcode app target, or a small script), not by SwiftPM — SwiftPM
         // executables don't produce .app bundles — so it's excluded here.
         .executableTarget(
-            name: "TapDeckApp",
+            name: "SystemAudioRecorderApp",
             dependencies: ["TapKit"],
-            path: "Sources/TapDeckApp",
+            path: "Sources/SystemAudioRecorderApp",
             exclude: ["Info.plist"],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
@@ -79,13 +80,13 @@ let package = Package(
         ),
 
         // Pure-C ring-buffer smoke test (Tests/CRingTests): exercises
-        // TapDeckRT's C API directly, with no Swift/C interop layer in
-        // between, as a cross-check against RingBufferTests.swift. Wired in
-        // as a real target (previously it sat unbuilt and unrun) and driven
-        // from TapKitTests via `td_ring_smoke_test_run()`.
+        // SystemAudioRecorderRT's C API directly, with no Swift/C interop
+        // layer in between, as a cross-check against RingBufferTests.swift.
+        // Wired in as a real target (previously it sat unbuilt and unrun)
+        // and driven from TapKitTests via `td_ring_smoke_test_run()`.
         .target(
             name: "CRingSmokeTest",
-            dependencies: ["TapDeckRT"],
+            dependencies: ["SystemAudioRecorderRT"],
             path: "Tests/CRingTests",
             publicHeadersPath: "include",
             cSettings: [
@@ -95,7 +96,7 @@ let package = Package(
 
         .testTarget(
             name: "TapKitTests",
-            dependencies: ["TapKit", "TapDeckRT", "CRingSmokeTest"],
+            dependencies: ["TapKit", "SystemAudioRecorderRT", "CRingSmokeTest"],
             path: "Tests/TapKitTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         )

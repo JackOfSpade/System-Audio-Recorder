@@ -1,5 +1,5 @@
 import CoreAudio
-import TapDeckRT
+import SystemAudioRecorderRT
 import Foundation
 
 /// Registers the IOProc via `AudioDeviceCreateIOProcIDWithBlock` with a NULL
@@ -10,7 +10,7 @@ import Foundation
 /// The Section 5.2 contract, honored exactly: the block captures nothing but
 /// an `OpaquePointer` (a plain value — no ARC traffic) to the lane's
 /// preallocated `td_context_t`, and its entire body is bounds-checking plus
-/// one call into a `TapDeckRT` C function. No Swift object is retained by the
+/// one call into a `SystemAudioRecorderRT` C function. No Swift object is retained by the
 /// closure; no allocation, lock, log call, or syscall happens in the body.
 public final class IOProcHost {
     private var procID: AudioDeviceIOProcID?
@@ -105,7 +105,7 @@ public final class IOProcHost {
         guard let procID else { return }
         let status = AudioDeviceStop(aggregateID, procID)
         if status != noErr {
-            FileHandle.standardError.write("TapDeck: AudioDeviceStop returned \(status); continuing teardown.\n".data(using: .utf8)!)
+            FileHandle.standardError.write("System Audio Recorder: AudioDeviceStop returned \(status); continuing teardown.\n".data(using: .utf8)!)
         }
     }
 
@@ -114,7 +114,7 @@ public final class IOProcHost {
         guard let procID else { return }
         let status = AudioDeviceDestroyIOProcID(aggregateID, procID)
         if status != noErr {
-            FileHandle.standardError.write("TapDeck: AudioDeviceDestroyIOProcID returned \(status); continuing teardown.\n".data(using: .utf8)!)
+            FileHandle.standardError.write("System Audio Recorder: AudioDeviceDestroyIOProcID returned \(status); continuing teardown.\n".data(using: .utf8)!)
         }
         self.procID = nil
     }

@@ -26,9 +26,9 @@ final class AppState: ObservableObject {
     private var operationInFlight = false
 
     init() {
-        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/TapDeck")
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/System Audio Recorder")
         self.engine = CaptureEngine(recordingsRoot: root)
-        self.processCatalog = ProcessCatalog(engineQueue: DispatchQueue(label: "com.tapdeck.app.processcatalog"))
+        self.processCatalog = ProcessCatalog(engineQueue: DispatchQueue(label: "com.systemaudiorecorder.app.processcatalog"))
         engine.onStatusChanged = { [weak self] status in
             Task { @MainActor in self?.status = status }
         }

@@ -110,14 +110,14 @@ public final class SegmentWriter {
     @discardableResult
     public func finalizeCurrentSegment() -> FinalizeResult {
         guard let segment = current else {
-            FileHandle.standardError.write("TapDeck: finalizeCurrentSegment called with no open segment\n".data(using: .utf8)!)
+            FileHandle.standardError.write("System Audio Recorder: finalizeCurrentSegment called with no open segment\n".data(using: .utf8)!)
             return FinalizeResult(frames: 0, succeeded: false)
         }
         let status = ExtAudioFileDispose(segment.file)
         let frames = segment.framesWritten
         current = nil
         if status != noErr {
-            FileHandle.standardError.write("TapDeck: ExtAudioFileDispose failed with status \(status)\n".data(using: .utf8)!)
+            FileHandle.standardError.write("System Audio Recorder: ExtAudioFileDispose failed with status \(status)\n".data(using: .utf8)!)
             return FinalizeResult(frames: frames, succeeded: false)
         }
         return FinalizeResult(frames: frames, succeeded: true)
@@ -144,7 +144,7 @@ public final class SegmentWriter {
             }
         }
 
-        let url = scratchDirectory.appendingPathComponent("tapdeck_selfcheck_\(UUID().uuidString).caf")
+        let url = scratchDirectory.appendingPathComponent("systemaudiorecorder_selfcheck_\(UUID().uuidString).caf")
         defer { try? FileManager.default.removeItem(at: url) }
 
         var fileASBD = asbd

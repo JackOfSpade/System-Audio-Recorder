@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.tapdeck.app</string>
+	<string>com.systemaudiorecorder.app</string>
 	<key>CFBundleName</key>
-	<string>TapDeck</string>
+	<string>System Audio Recorder</string>
 	<key>CFBundleDisplayName</key>
-	<string>TapDeck</string>
+	<string>System Audio Recorder</string>
 	<key>CFBundleExecutable</key>
-	<string>TapDeckApp</string>
+	<string>SystemAudioRecorderApp</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -21,17 +21,17 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>TapDeck records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.</string>
+	<string>System Audio Recorder records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>TapDeck</string>
+	<string>System Audio Recorder</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.tapdeck.app.url</string>
+			<string>com.systemaudiorecorder.app.url</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>tapdeck</string>
+				<string>systemaudiorecorder</string>
 			</array>
 		</dict>
 	</array>

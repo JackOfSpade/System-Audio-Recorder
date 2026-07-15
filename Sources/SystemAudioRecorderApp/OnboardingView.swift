@@ -13,8 +13,8 @@ struct OnboardingView: View {
         VStack(spacing: 16) {
             Image(systemName: "waveform")
                 .font(.system(size: 48))
-            Text("Welcome to TapDeck").font(.title)
-            Text("TapDeck records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.")
+            Text("Welcome to System Audio Recorder").font(.title)
+            Text("System Audio Recorder records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.")
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
 
@@ -26,7 +26,7 @@ struct OnboardingView: View {
                 .buttonStyle(.borderedProminent)
             case .granted:
                 Text("Permission granted.").foregroundStyle(.green)
-                Text("The tapdeck CLI will request its own separate permission the first time it records.")
+                Text("The systemaudiorecorder CLI will request its own separate permission the first time it records.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Done", action: onDismiss)
                     .buttonStyle(.borderedProminent)

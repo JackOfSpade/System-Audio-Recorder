@@ -29,7 +29,7 @@ public enum ExportError: Error, CustomStringConvertible {
 
 /// Post-capture transcodes from the CAF float master — NEVER by re-capture
 /// (Section 6.6). Sample rate is never changed on export (no SRC anywhere in
-/// the product). TapDeck performs its own Float32 -> Int16/Int24 quantization
+/// the product). System Audio Recorder performs its own Float32 -> Int16/Int24 quantization
 /// (with optional TPDF dither) before handing already-quantized integer PCM
 /// to `ExtAudioFile`, so the codec's `AudioConverter` step only ever does
 /// lossless encoding — never an uncontrolled float/dither conversion we
@@ -169,7 +169,7 @@ public enum ExportService {
         // good export there) if a read/write status ever failed partway
         // through, with nothing to clean it up.
         let tempURL = destinationURL.deletingLastPathComponent()
-            .appendingPathComponent(".tapdeck_export_tmp_\(UUID().uuidString)")
+            .appendingPathComponent(".systemaudiorecorder_export_tmp_\(UUID().uuidString)")
         do {
             let clipCount = try writeIntegerPCMFile(
                 to: tempURL, readFile: &readFile, fileTypeID: fileTypeID,
@@ -310,7 +310,7 @@ public enum ExportService {
         // Same atomic-write reasoning as exportIntegerPCM: write to a temp
         // file, replace the final destination only on success.
         let tempURL = destinationURL.deletingLastPathComponent()
-            .appendingPathComponent(".tapdeck_export_tmp_\(UUID().uuidString)")
+            .appendingPathComponent(".systemaudiorecorder_export_tmp_\(UUID().uuidString)")
         do {
             try writeAACFile(to: tempURL, readFile: &readFile, channels: channels, sampleRate: sampleRate, gainLinear: gainLinear)
             _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: tempURL)

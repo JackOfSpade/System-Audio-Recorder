@@ -29,7 +29,7 @@ public enum PermissionBroker {
     }
 
     /// The public throwaway-tap probe (Section 9.4 default path). Builds a
-    /// minimal global stereo-mixdown tap excluding TapDeck's own PID,
+    /// minimal global stereo-mixdown tap excluding System Audio Recorder's own PID,
     /// attempts to create it, and immediately destroys it on success.
     @discardableResult
     public static func requestCapturePermission() -> PermissionOutcome {
@@ -44,7 +44,7 @@ public enum PermissionBroker {
         let excludeList: [AudioObjectID] = ownProcessObjectID.map { [$0] } ?? []
 
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeList)
-        description.name = "TapDeck Permission Probe"
+        description.name = "System Audio Recorder Permission Probe"
         description.isPrivate = true
         description.muteBehavior = .unmuted
 

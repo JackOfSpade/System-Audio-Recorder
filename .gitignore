@@ -3,3 +3,4 @@ build/
 .DS_Store
 *.xcuserstate
 xcuserdata/
+/System Audio Recorder.app

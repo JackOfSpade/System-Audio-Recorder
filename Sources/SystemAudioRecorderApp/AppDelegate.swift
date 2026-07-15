@@ -35,7 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the user to tell whether Cmd+Q had done anything at all.
         let alert = NSAlert()
         alert.messageText = "Recording in progress"
-        alert.informativeText = "TapDeck is currently recording. Stop the recording before quitting, or quit anyway to stop it now and finalize the recording."
+        alert.informativeText = "System Audio Recorder is currently recording. Stop the recording before quitting, or quit anyway to stop it now and finalize the recording."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Stop Recording and Quit")
         alert.addButton(withTitle: "Cancel")
@@ -50,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "TapDeck")
+            button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "System Audio Recorder")
             button.action = #selector(togglePopover)
             button.target = self
         }
@@ -103,7 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 styleMask: [.titled, .closable, .resizable, .miniaturizable],
                 backing: .buffered, defer: false
             )
-            window.title = "TapDeck Library"
+            window.title = "System Audio Recorder Library"
             window.contentViewController = NSHostingController(rootView: LibraryView(appState: appState))
             window.isReleasedWhenClosed = false
             libraryWindow = window
@@ -119,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 styleMask: [.titled, .closable, .miniaturizable],
                 backing: .buffered, defer: false
             )
-            window.title = "TapDeck Settings"
+            window.title = "System Audio Recorder Settings"
             window.contentViewController = NSHostingController(rootView: SettingsView(appState: appState))
             window.isReleasedWhenClosed = false
             settingsWindow = window
@@ -133,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 440, height: 360),
             styleMask: [.titled], backing: .buffered, defer: false
         )
-        window.title = "Welcome to TapDeck"
+        window.title = "Welcome to System Audio Recorder"
         window.center()
         window.contentViewController = NSHostingController(rootView: OnboardingView(appState: appState) { [weak self, weak window] in
             UserDefaults.standard.set(true, forKey: Self.hasOnboardedKey)

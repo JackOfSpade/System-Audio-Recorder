@@ -2,7 +2,7 @@ import XCTest
 import CRingSmokeTest
 
 /// Runs the pure-C ring buffer smoke test (Tests/CRingTests/ring_smoke_test.c)
-/// as part of the normal test suite. That file exercises TapDeckRT's C API
+/// as part of the normal test suite. That file exercises SystemAudioRecorderRT's C API
 /// directly, with no Swift/C interop layer in between, complementing
 /// RingBufferTests.swift's coverage of the same cases through Swift.
 final class RingSmokeCTests: XCTestCase {

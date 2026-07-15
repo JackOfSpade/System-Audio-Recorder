@@ -13,7 +13,7 @@ public enum EngineStatus: Sendable {
 /// runs the session lifecycle. Owns the **engine queue** — every Core Audio
 /// hardware call in the process is serialized on it (Section 4.4).
 public final class CaptureEngine {
-    private let engineQueue = DispatchQueue(label: "com.tapdeck.engine", qos: .userInitiated)
+    private let engineQueue = DispatchQueue(label: "com.systemaudiorecorder.engine", qos: .userInitiated)
     public let sessionStore: SessionStore
 
     private var lanes: [CaptureLane] = []
@@ -134,7 +134,7 @@ public final class CaptureEngine {
             processes: [], calibration: nil, segments: [], events: []
         )]
 
-        let appInfo = AppInfo(name: "TapDeck", version: "0.1.0", build: "1")
+        let appInfo = AppInfo(name: "System Audio Recorder", version: "0.1.0", build: "1")
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         let osInfo = OSInfo(version: osVersion, build: "unknown")
         let newManifest = SessionManifest(app: appInfo, os: osInfo, session: sessionInfo, lanes: laneEntries)

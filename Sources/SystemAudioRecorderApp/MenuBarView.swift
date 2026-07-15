@@ -56,7 +56,7 @@ struct MenuBarView: View {
             Button("Open Library…", action: openLibrary)
             Button("Settings…", action: openSettings)
             Divider()
-            Button("Quit TapDeck") { quit() }
+            Button("Quit System Audio Recorder") { quit() }
                 .disabled(appState.isRecording)
                 .help(appState.isRecording ? "Stop the current recording first." : "")
         }

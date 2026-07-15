@@ -1,5 +1,5 @@
 /*
- * td_ring.h — TapDeckRT real-time capture primitives.
+ * td_ring.h — SystemAudioRecorderRT real-time capture primitives.
  *
  * Everything declared here is safe to call from the HAL real-time IOProc
  * thread: no locks, no heap allocation on the hot path, no Swift/ObjC

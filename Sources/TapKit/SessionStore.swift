@@ -14,7 +14,7 @@ public final class SessionStore {
     /// Section 6.4 "Write policy": all manifest file I/O is serialized on
     /// this dedicated serial queue — the engine queue only ever hands event
     /// records to `SessionStore`'s API, never touches the file itself.
-    private let ioQueue = DispatchQueue(label: "com.tapdeck.sessionstore.io")
+    private let ioQueue = DispatchQueue(label: "com.systemaudiorecorder.sessionstore.io")
 
     public init(recordingsRoot: URL) {
         self.recordingsRoot = recordingsRoot
@@ -159,7 +159,7 @@ public final class SessionStore {
                 // Previously encode failures were swallowed by `try?` with no
                 // logging at all, unlike the write/rename failure below —
                 // silently dropping the entire manifest update on the floor.
-                FileHandle.standardError.write("TapDeck: manifest write failed: \(error)\n".data(using: .utf8)!)
+                FileHandle.standardError.write("System Audio Recorder: manifest write failed: \(error)\n".data(using: .utf8)!)
             }
             completion?()
         }
