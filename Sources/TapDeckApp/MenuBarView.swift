@@ -19,11 +19,11 @@ struct MenuBarView: View {
             .buttonStyle(.borderedProminent)
             .disabled(appState.permissionOutcome == .notGranted)
 
-            Picker("Source", selection: $appState.selectedSource) {
-                Text("System Audio").tag(AppState.SourceChoice.system)
+            HStack {
+                Text("Source")
+                Spacer()
+                Text("System Audio").foregroundStyle(.secondary)
             }
-            .pickerStyle(.menu)
-            .disabled(appState.isRecording)
 
             Divider()
 

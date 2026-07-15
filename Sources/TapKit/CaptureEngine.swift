@@ -85,19 +85,7 @@ public final class CaptureEngine {
             completion(.failure(CaptureEngineError.alreadyRecording))
             return
         }
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        let plan = SessionSpecPlanner.lanePlan(for: spec, ownPID: ownPID)
-
-        let sourceLabel: String
-        switch spec.source {
-        case .systemMix: sourceLabel = "System Audio"
-        case .appSet(let apps, _):
-            if let first = apps.first {
-                sourceLabel = LaneSlug.slug(for: first) + (apps.count > 1 ? " +\(apps.count - 1)" : "")
-            } else {
-                sourceLabel = "Selected Apps"
-            }
-        }
+        let sourceLabel = "System Audio"
 
         let deviceID = (try? resolveDeviceID(spec.device)) ?? (try? AudioDeviceDirectory.defaultOutputDevice())
         let deviceUID = deviceID.flatMap { try? AudioDeviceDirectory.deviceUID($0) } ?? "unknown"
@@ -116,50 +104,36 @@ public final class CaptureEngine {
         sessionStore.createLockFile(in: folder)
         sessionFolder = folder
 
-        var sourceApps: [String] = []
-        if case .appSet(let apps, _) = spec.source {
-            sourceApps = apps.compactMap { if case .bundleID(let b) = $0 { return b } else { return nil } }
-        }
-
         let sessionInfo = SessionInfo(
             id: UUID().uuidString,
             title: title,
             createdAt: ManifestTimestamp.now(),
             finalizedAt: nil,
             recovered: false,
-            sourceType: { if case .systemMix = spec.source { return "systemMix" } else { return "appSet" } }(),
-            sourceApps: sourceApps,
+            sourceType: "systemMix",
             device: DeviceRef(uid: deviceUID, name: deviceName),
             deviceHistory: [DeviceHistoryEntry(uid: deviceUID, name: deviceName, fromWallTime: ManifestTimestamp.now())],
-            multiTrack: { if case .appSet(_, let mt) = spec.source { return mt } else { return false } }(),
             timelinePolicy: spec.timelinePolicy.rawValue
         )
 
-        var newLanes: [CaptureLane] = []
-        var newLaneDelegates: [ManifestUpdatingDelegate] = []
-        var laneEntries: [LaneEntry] = []
-        for descriptor in plan.lanes {
-            let laneDir = folder.appendingPathComponent(descriptor.slug)
-            let lane = CaptureLane(
-                index: descriptor.index,
-                slug: descriptor.slug,
-                laneDirectory: laneDir,
-                spec: spec,
-                appSelectors: descriptor.apps,
-                excludeBundleIDs: descriptor.excludeBundleIDs,
-                engineQueue: engineQueue
-            )
-            let laneDelegate = ManifestUpdatingDelegate(engine: self)
-            lane.delegate = laneDelegate
-            newLaneDelegates.append(laneDelegate)
-            newLanes.append(lane)
-            laneEntries.append(LaneEntry(
-                index: descriptor.index, slug: descriptor.slug, kind: descriptor.kind.rawValue,
-                processes: [], calibration: nil, segments: [], events: []
-            ))
-        }
-        lanes = newLanes
-        laneDelegates = newLaneDelegates
+        // Always exactly one lane, slug "mix" — Section 4.6.
+        let laneDir = folder.appendingPathComponent("mix")
+        let lane = CaptureLane(
+            index: 0,
+            slug: "mix",
+            laneDirectory: laneDir,
+            spec: spec,
+            excludeBundleIDs: spec.excludeBundleIDs,
+            engineQueue: engineQueue
+        )
+        let laneDelegate = ManifestUpdatingDelegate(engine: self)
+        lane.delegate = laneDelegate
+        lanes = [lane]
+        laneDelegates = [laneDelegate]
+        let laneEntries = [LaneEntry(
+            index: 0, slug: "mix", kind: "mix",
+            processes: [], calibration: nil, segments: [], events: []
+        )]
 
         let appInfo = AppInfo(name: "TapDeck", version: "0.1.0", build: "1")
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString

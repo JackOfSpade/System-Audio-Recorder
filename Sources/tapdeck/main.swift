@@ -45,26 +45,6 @@ struct ArgParser {
         }
         return args[idx + 1]
     }
-
-    /// Like `value`, but collects every occurrence (used for repeatable
-    /// flags like `--app`) — a dangling trailing occurrence with no value
-    /// still fails loudly rather than being silently dropped.
-    func values(_ name: String) -> [String] {
-        var result: [String] = []
-        var i = 0
-        while i < args.count {
-            if args[i] == name {
-                guard i + 1 < args.count else {
-                    fail(.usage, "\(name) requires a value.")
-                }
-                result.append(args[i + 1])
-                i += 2
-            } else {
-                i += 1
-            }
-        }
-        return result
-    }
 }
 
 // MARK: --device resolution (Section 3.8 / 7.2 — owning surface here)
@@ -103,24 +83,6 @@ func runRecord(_ parser: ArgParser) -> Never {
         fail(.permissionDenied, "System audio capture permission was not granted. Open System Settings > Privacy & Security > Screen & System Audio Recording.")
     }
 
-    let appBundleIDs = parser.values("--app")
-    let multiTrack = parser.flag("--multitrack")
-    if multiTrack && appBundleIDs.count < 2 {
-        fail(.usage, "--multitrack requires >= 2 --app values.")
-    }
-    if parser.flag("--system") && !appBundleIDs.isEmpty {
-        // Previously --system silently won and --app was discarded with no
-        // warning — the user's app selection had no effect whatsoever.
-        fail(.usage, "--system and --app are mutually exclusive: --system records the full unfiltered mix, --app restricts to specific processes. Pass only one.")
-    }
-
-    let source: SourceModel
-    if parser.flag("--system") || appBundleIDs.isEmpty {
-        source = .systemMix(excludeBundleIDs: [])
-    } else {
-        source = .appSet(apps: appBundleIDs.map { .bundleID($0) }, multiTrack: multiTrack)
-    }
-
     var device: DevicePolicy = .followSystemDefault
     if let deviceArg = parser.value("--device") {
         let id = resolveDevice(deviceArg)
@@ -152,7 +114,7 @@ func runRecord(_ parser: ArgParser) -> Never {
         maxSilenceStopSeconds = parsed
     }
 
-    let spec = SessionSpec(source: source, device: device)
+    let spec = SessionSpec(device: device)
     let engine = CaptureEngine(recordingsRoot: recordingsRoot(from: parser))
 
     let startSemaphore = DispatchSemaphore(value: 0)

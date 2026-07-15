@@ -13,15 +13,9 @@ final class AppState: ObservableObject {
 
     @Published var status: EngineStatus = .idle
     @Published var permissionOutcome: PermissionOutcome = PermissionBroker.cachedOutcome
-    @Published var selectedSource: SourceChoice = .system
     @Published var elapsedSeconds: TimeInterval = 0
     @Published var meters: [MeterSnapshot] = []
     @Published var lastEventDescription: String = ""
-
-    enum SourceChoice: Hashable {
-        case system
-        case apps([String], multiTrack: Bool)
-    }
 
     private var recordStartedAt: Date?
     private var meterPollTimer: Timer?
@@ -73,13 +67,7 @@ final class AppState: ObservableObject {
     func start() {
         guard !operationInFlight else { return }
         operationInFlight = true
-        let spec: SessionSpec
-        switch selectedSource {
-        case .system:
-            spec = SessionSpec(source: .systemMix(excludeBundleIDs: []))
-        case .apps(let bundleIDs, let multiTrack):
-            spec = SessionSpec(source: .appSet(apps: bundleIDs.map { .bundleID($0) }, multiTrack: multiTrack))
-        }
+        let spec = SessionSpec()
         engine.start(spec: spec) { [weak self] result in
             Task { @MainActor in
                 guard let self else { return }

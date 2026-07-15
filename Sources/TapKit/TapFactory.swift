@@ -27,7 +27,6 @@ public enum TapFactory {
     public static func create(
         spec: SessionSpec,
         laneSlug: String,
-        laneApps: [AudioObjectID],
         excludeProcessIDs: [AudioObjectID],
         bufferFrameSize: UInt32
     ) throws -> TapHandle {
@@ -46,13 +45,9 @@ public enum TapFactory {
         let nominalRate = try AudioDeviceDirectory.nominalSampleRate(deviceID)
         let channelCount = (try? AudioDeviceDirectory.outputChannelCount(deviceID)) ?? 2
 
-        // Step 2: build the CATapDescription per the source model + tap config.
-        let description = try buildDescription(
-            spec: spec,
-            laneApps: laneApps,
-            excludeProcessIDs: excludeProcessIDs,
-            deviceUID: deviceUID
-        )
+        // Step 2: build the CATapDescription — always a global system-mix
+        // tap excluding `excludeProcessIDs` (Section 4.5 step 2).
+        let description = buildDescription(spec: spec, excludeProcessIDs: excludeProcessIDs)
 
         // Step 3: create the tap; read back UID + format.
         var tapID: AudioObjectID = 0
@@ -140,37 +135,16 @@ public enum TapFactory {
         }
     }
 
-    /// Section 4.5 step 2 — the exact initializer per source model, using
-    /// the real CATapDescription API (verified against the CoreAudio SDK
-    /// headers directly, not assumed): the friendly `[AudioObjectID]`-typed
-    /// overlay initializers exist for the mixdown/global-exclude cases.
-    /// The unmixed `matchDeviceLayout` mode has NO plain "these processes,
-    /// unmixed" initializer in the real API — only a device-stream-scoped
-    /// variant (`initWithProcesses:andDeviceUID:withStream:`), which is also
-    /// NOT overlaid for Swift (it remains a raw NS_REFINED_FOR_SWIFT symbol
-    /// taking `[NSNumber]`, imported as `init(__processes:andDeviceUID:withStream:)`).
-    /// Stream index 0 is used as the common case; Section 11 R6 flags that
-    /// this needs hands-on verification against real multichannel hardware.
+    /// Section 4.5 step 2 — always a global stereo tap of everything the Mac
+    /// plays, minus `excludeProcessIDs` (which always includes TapDeck's own
+    /// PID, appended by `CaptureLane`), using `CATapDescription`'s
+    /// `stereoGlobalTapButExcludeProcesses:` initializer (verified against
+    /// the CoreAudio SDK headers directly, not assumed).
     private static func buildDescription(
         spec: SessionSpec,
-        laneApps: [AudioObjectID],
-        excludeProcessIDs: [AudioObjectID],
-        deviceUID: String
-    ) throws -> CATapDescription {
-        let description: CATapDescription
-
-        switch spec.source {
-        case .systemMix:
-            description = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeProcessIDs)
-
-        case .appSet:
-            if spec.tapConfig.matchDeviceLayout {
-                let nsIDs = laneApps.map { NSNumber(value: $0) }
-                description = CATapDescription(__processes: nsIDs, andDeviceUID: deviceUID, withStream: 0)
-            } else {
-                description = CATapDescription(stereoMixdownOfProcesses: laneApps)
-            }
-        }
+        excludeProcessIDs: [AudioObjectID]
+    ) -> CATapDescription {
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeProcessIDs)
 
         description.name = "TapDeck Tap"
         description.isPrivate = true

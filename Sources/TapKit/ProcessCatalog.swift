@@ -77,23 +77,17 @@ public final class ProcessCatalog {
         return objectID
     }
 
-    /// Resolves an `AppSelector` (Section 3.4) to a process `AudioObjectID`,
-    /// matching by bundle id (across all currently running audio processes)
-    /// or by direct PID translation.
-    public static func resolve(_ selector: AppSelector) -> AudioObjectID? {
-        switch selector {
-        case .pid(let pid):
-            return try? translatePIDToProcessObject(pid)
-        case .bundleID(let bundleID):
-            guard let processes = try? allProcesses() else { return nil }
-            return processes.first { $0.bundleID == bundleID }?.objectID
-        }
+    /// Resolves a bundle id (Section 3.4 exclusion list) to a process
+    /// `AudioObjectID`, matching across all currently running audio processes.
+    public static func resolveBundleID(_ bundleID: String) -> AudioObjectID? {
+        guard let processes = try? allProcesses() else { return nil }
+        return processes.first { $0.bundleID == bundleID }?.objectID
     }
 
     /// "Is any relevant process currently outputting audio?" (Section 8.1
-    /// corroboration signal). `excluding` covers TapDeck's own PID and any
-    /// `.systemMix` exclusion list; `restrictedTo`, when non-nil, scopes the
-    /// check to only those processes (Section 8.1 "For .appSet lanes").
+    /// corroboration signal). `excludingPIDs` covers TapDeck's own PID and
+    /// any system-mix exclusion list; `restrictedToBundleIDs` is always nil
+    /// now that recording is always a global system-mix tap.
     public static func isAnyRelevantProcessOutputting(excludingPIDs: Set<pid_t>, restrictedToBundleIDs: Set<String>?) -> Bool {
         guard let processes = try? allProcesses() else { return false }
         for process in processes {

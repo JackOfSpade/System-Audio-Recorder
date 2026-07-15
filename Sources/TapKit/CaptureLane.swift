@@ -39,7 +39,6 @@ public final class CaptureLane {
     private let engineQueue: DispatchQueue
     private let spec: SessionSpec
     private let excludeBundleIDs: [String]
-    private let appSelectors: [AppSelector]
     private let bufferFrameSize: UInt32
     private let ownPID: pid_t
 
@@ -93,7 +92,6 @@ public final class CaptureLane {
         slug: String,
         laneDirectory: URL,
         spec: SessionSpec,
-        appSelectors: [AppSelector],
         excludeBundleIDs: [String],
         engineQueue: DispatchQueue,
         bufferFrameSize: UInt32 = 512
@@ -102,7 +100,6 @@ public final class CaptureLane {
         self.slug = slug
         self.laneDirectory = laneDirectory
         self.spec = spec
-        self.appSelectors = appSelectors
         self.excludeBundleIDs = excludeBundleIDs
         self.engineQueue = engineQueue
         self.bufferFrameSize = bufferFrameSize
@@ -123,7 +120,7 @@ public final class CaptureLane {
             guard let self else { return }
             let audioExpected = ProcessCatalog.isAnyRelevantProcessOutputting(
                 excludingPIDs: [self.ownPID],
-                restrictedToBundleIDs: self.relevantBundleIDsForCorroboration
+                restrictedToBundleIDs: nil
             )
             self.corroborationCacheLock.lock()
             self.cachedAudioExpected = audioExpected
@@ -182,12 +179,10 @@ public final class CaptureLane {
     /// switch / rate change rebuilds do this before calling rebuild()).
     private func buildAndRun(reuseExistingSegment: Bool) throws {
         let excludeIDs = resolveExcludeProcessObjectIDs()
-        let laneProcessIDs = resolveAppProcessObjectIDs()
 
         let handle = try TapFactory.create(
             spec: spec,
             laneSlug: slug,
-            laneApps: laneProcessIDs,
             excludeProcessIDs: excludeIDs,
             bufferFrameSize: bufferFrameSize
         )
@@ -253,15 +248,11 @@ public final class CaptureLane {
             ids.append(ownObjectID)
         }
         for bundleID in excludeBundleIDs {
-            if let id = ProcessCatalog.resolve(.bundleID(bundleID)) {
+            if let id = ProcessCatalog.resolveBundleID(bundleID) {
                 ids.append(id)
             }
         }
         return ids
-    }
-
-    private func resolveAppProcessObjectIDs() -> [AudioObjectID] {
-        appSelectors.compactMap { ProcessCatalog.resolve($0) }
     }
 
     private func makeSegmentEntry(from segment: SegmentWriter.OpenSegment) -> SegmentEntry {
@@ -534,19 +525,6 @@ public final class CaptureLane {
     /// `ZeroWatchdog.state` is internally lock-guarded.
     public var watchdogState: WatchdogState {
         watchdog.state
-    }
-
-    fileprivate var relevantBundleIDsForCorroboration: Set<String>? {
-        switch spec.source {
-        case .systemMix:
-            return nil // check all non-excluded processes
-        case .appSet:
-            let ids = appSelectors.compactMap { selector -> String? in
-                if case .bundleID(let b) = selector { return b }
-                return nil
-            }
-            return ids.isEmpty ? nil : Set(ids)
-        }
     }
 }
 

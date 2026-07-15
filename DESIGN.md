@@ -7,15 +7,15 @@
 
 ## 1. Executive Summary
 
-TapDeck is a fully-owned, deeply customizable native macOS application that records what the Mac plays — the entire system mix, or the output of specific applications — at the highest fidelity macOS makes available to any third-party application. It is a menu-bar-first GUI app with a full sessions Library and Settings, paired with a standalone `tapdeck` command-line tool for headless and scripted use. Minimum deployment target is macOS 14.4; distribution is Developer ID–signed, notarized, hardened-runtime, **unsandboxed**, outside the Mac App Store.
+TapDeck is a fully-owned, deeply customizable native macOS application that records what the Mac plays — the entire system mix, minus any apps you choose to exclude — at the highest fidelity macOS makes available to any third-party application. It is a menu-bar-first GUI app with a full sessions Library and Settings, paired with a standalone `tapdeck` command-line tool for headless and scripted use. Minimum deployment target is macOS 14.4; distribution is Developer ID–signed, notarized, hardened-runtime, **unsandboxed**, outside the Mac App Store.
 
-**Core architecture.** Capture uses Apple's Core Audio **Process Tap** API: a `CATapDescription` (global with exclusions, or targeting specific process objects) is instantiated with `AudioHardwareCreateProcessTap`, wrapped as a sub-tap inside a **private aggregate device** whose main sub-device is the real output device, and read with a **raw IOProc** registered via `AudioDeviceCreateIOProcIDWithBlock`. This delivers Core Audio's internal 32-bit float mix without installing a driver, without touching the user's audio routing, and without the Screen Recording–shaped compromises of ScreenCaptureKit. AVAudioEngine is explicitly banned from the capture path: it cannot be retargeted to a tap-backed aggregate device (the retarget silently no-ops and reads the default input instead) — a documented trap this design avoids by construction. Virtual-driver approaches (HAL plugin / AudioDriverKit) were evaluated and rejected: they add install friction, reroute the user's audio, introduce drift correction, and deliver **no fidelity advantage** over the tap.
+**Core architecture.** Capture uses Apple's Core Audio **Process Tap** API: a `CATapDescription` (global, with exclusions) is instantiated with `AudioHardwareCreateProcessTap`, wrapped as a sub-tap inside a **private aggregate device** whose main sub-device is the real output device, and read with a **raw IOProc** registered via `AudioDeviceCreateIOProcIDWithBlock`. This delivers Core Audio's internal 32-bit float mix without installing a driver, without touching the user's audio routing, and without the Screen Recording–shaped compromises of ScreenCaptureKit. AVAudioEngine is explicitly banned from the capture path: it cannot be retargeted to a tap-backed aggregate device (the retarget silently no-ops and reads the default input instead) — a documented trap this design avoids by construction. Virtual-driver approaches (HAL plugin / AudioDriverKit) were evaluated and rejected: they add install friction, reroute the user's audio, introduce drift correction, and deliver **no fidelity advantage** over the tap.
 
 **The fidelity target — stated honestly.** macOS applies a non-optional ingestion-side reconstruction filter to all Process Tap captures; on synthetic broadband signals (a 200 Hz square wave) this leaves a measurable Gibbs-ringing residual (≈ −2.9 dBFS RMS in null tests), so capture is *not* mathematically sample-identical. For real content it is perceptually and practically lossless, and — critically — this ceiling is imposed by the OS on every driverless third-party capture tool, including the leading commercial ones. TapDeck's design goal is therefore **near-bit-perfect**: add *zero* degradation of its own. Concretely: capture at the output device's actual current nominal sample rate (never assumed, never converted), keep samples in 32-bit float end-to-end, apply no gain, dither, or resampling in the master path, and write masters as Float32 **CAF** — never WAV, which has a known Core Audio bug that silently truncates float to Int32. The validation plan (Section 10) includes a full null-test methodology to prove, and continuously re-prove, that TapDeck sits exactly at the OS ceiling.
 
 **Defensive engineering.** Two known macOS bugs shape the design. First, an intermittent failure mode in which the tap keeps delivering validly-timestamped buffers of exact zeros while audio audibly plays: TapDeck runs a **ZeroWatchdog** that distinguishes this from genuine silence by corroborating sustained exact-zero runs against an independent "is any process actually emitting audio?" signal (`kAudioProcessPropertyIsRunningOutput`), and recovers with the only known-reliable fix — a full, strictly-ordered teardown and rebuild of the IOProc, aggregate device, and tap — while keeping the recording file open so sessions survive recovery (Section 8). Second, a level-attenuation bug on multi-output-channel devices (level scales roughly as 20·log₁₀ of the output stereo-pair count — ~12 dB measured on a 4-pair interface): TapDeck detects at-risk devices, offers a one-shot calibration that measures the actual offset, stores it as metadata, and applies compensation on export — never silently altering the master (Section 8).
 
-**Product shape and customizability.** The feature set is deliberately coherent rather than maximal: per-app and system-wide source selection with multi-track (one file per app) recording; automatic session segmentation across device switches and sample-rate changes with a machine-readable `session.json` manifest; a lossless-first export pipeline (FLAC, ALAC, AAC, and compatibility WAV derived from the CAF master); live metering with capture-health status; and a full automation surface — CLI, URL scheme, Shortcuts (App Intents), shell hooks on session events, scheduled recordings, and "record while app X is playing" triggers. Excluded from v1, on purpose: live monitoring/routing (system audio is already audible), any sample-rate conversion anywhere, loudness normalization, and Mac App Store distribution (the tap API is unreliable under App Sandbox).
+**Product shape and customizability.** The feature set is deliberately coherent rather than maximal: global system-mix recording with an app exclusion list; automatic session segmentation across device switches and sample-rate changes with a machine-readable `session.json` manifest; a lossless-first export pipeline (FLAC, ALAC, AAC, and compatibility WAV derived from the CAF master); live metering with capture-health status; and a full automation surface — CLI, URL scheme, Shortcuts (App Intents), shell hooks on session events, scheduled recordings, and "record while app X is playing" triggers. Excluded from v1, on purpose: live monitoring/routing (system audio is already audible), any sample-rate conversion anywhere, loudness normalization, and Mac App Store distribution (the tap API is unreliable under App Sandbox).
 
 **Implementation stack.** Swift throughout, with one small C target (`TapDeckRT`) for the real-time path: the IOProc callback only calls C ring-buffer functions, so the Swift runtime (ARC, exclusivity checks, allocation) can never stall the HAL real-time thread. A shared framework (`TapKit`) contains all capture, device, watchdog, file, and export logic and is consumed by both the GUI app and the CLI. The build proceeds in ten validated phases (Section 12), starting with a end-to-end spike (global tap → CAF file) that proves permissions, tap plumbing, and file integrity before any product code is written.
 
@@ -106,8 +106,6 @@ One honesty note frames everything in this table: TapDeck targets "near-bit-perf
 | Feature | Summary | Why it's in |
 |---|---|---|
 | System-mix recording | Global tap of everything the Mac plays, minus an exclusion list | The core promise |
-| Per-app recording | One or more chosen apps, mixed or multi-track | The differentiator over "just record everything" |
-| Multi-track lanes | One CAF master per app, time-aligned via manifest host times | Podcast/streamer workflows |
 | Device targeting | Follow system default (with mid-session device switching) or pin a fixed device | Fidelity depends on which device's rate/format we tap (Section 7) |
 | Float32 CAF masters | Untouched, tap-native rate, crash-safe segments | Fidelity rule (Section 6) |
 | Exports | FLAC 16/24, ALAC 16/24, AAC ~256 kbps VBR, WAV 24-bit (compatibility only) — always from the master | Small shareable files without compromising the archive |
@@ -133,13 +131,11 @@ Each exclusion is a decision, not an omission. The implementer must not add thes
 
 ### 3.4 Source model
 
-A recording is fully described by a `SessionSpec` (consumed by `CaptureEngine`, Section 4). Its `source` is one of:
+A recording is fully described by a `SessionSpec` (consumed by `CaptureEngine`, Section 4). Recording is always a single global tap built with `CATapDescription(stereoGlobalTapButExcludeProcesses:)`, configured by:
 
-- **`.systemMix(excludeBundleIDs: [String])`** — one global tap built with `CATapDescription(stereoGlobalTapButExcludeProcesses:)`. The exclusion list ALWAYS contains TapDeck's own PID (prevents feedback if TapDeck ever emits UI sounds); the user can add more apps to exclude (e.g. record everything except a video call). UI label: **"System Audio"**, with an "Exclude apps…" disclosure.
-- **`.appSet(apps: [AppSelector], multiTrack: false)`** — ONE tap targeting all selected process objects; a single mixed lane and a single set of files. `AppSelector` is a bundle id (preferred — survives app relaunch) or a raw PID (for processes without bundle ids). UI label: **"Selected Apps (mixed)"**.
-- **`.appSet(apps: [AppSelector], multiTrack: true)`** — one `CaptureLane` per app: each gets its own tap, private aggregate device, IOProc, ring buffer, and per-lane CAF files in its own `<lane-slug>/` subfolder. Cross-lane alignment comes from each segment's first-buffer `mHostTime` in the manifest (Section 6). UI label: **"Selected Apps (multi-track)"**.
+- **`excludeBundleIDs: [String]`** — bundle ids excluded from the tap. The exclusion list ALWAYS contains TapDeck's own PID (prevents feedback if TapDeck ever emits UI sounds); the user can add more apps to exclude (e.g. record everything except a video call). UI label: **"System Audio"**, with an "Exclude apps…" disclosure.
 
-Per-lane tap configuration: default is **stereo mixdown**; the Advanced option `matchDeviceLayout` captures unmixed at the device channel count (flagged "verify channel behavior hands-on" — Section 11). `muteBehavior` is `.unmuted` by default; `.mutedWhenTapped` is exposed as the **"Silent capture"** advanced toggle in Settings → Recording.
+There is no per-app or multi-track capture mode — an earlier revision of this design supported selecting specific apps to isolate (`.appSet`, with an optional one-lane-per-app `multiTrack` mode and an unmixed `matchDeviceLayout` tap variant). It was removed: a global tap already captures whatever is playing, muting the physical output doesn't affect what the tap sees (Section 1), and maintaining per-app isolation as a second capture path wasn't worth the surface area for a single-source-at-a-time usage pattern. `muteBehavior` is `.unmuted` by default; `.mutedWhenTapped` is exposed as the **"Silent capture"** advanced toggle in Settings → Recording.
 
 ### 3.5 Device targeting
 
@@ -157,7 +153,7 @@ The UI shows the resolved device plus its current nominal sample rate at all tim
 Status-item icon: a template waveform glyph; while recording it gains a red recording dot; while `REBUILDING`/`WAITING_FOR_DEVICE` the dot pulses amber; in the Error/`FAILED` state the glyph gains a small ✕ badge that persists until the user opens the dropdown and acknowledges the error line. The dropdown, top to bottom:
 
 1. **Record/Stop button** — large, single primary action for the currently configured `SessionSpec`.
-2. **Source picker** — "System Audio", a recents list of previously used apps, and **"Choose Apps…"** which opens a picker listing running audio-capable processes from `ProcessCatalog`, each with a live-output dot (`kAudioProcessPropertyIsRunningOutput`) so the user can see who is actually playing. The picker has the mixed/multi-track switch and the exclusion editor for system mix.
+2. **Source readout** — always "System Audio", with an "Exclude apps…" disclosure that opens a picker listing running audio-capable processes from `ProcessCatalog`, each with a live-output dot (`kAudioProcessPropertyIsRunningOutput`) so the user can see who is actually playing, and lets them add/remove bundle ids from the tap's exclusion list.
 3. **Device readout** — resolved output device name + current sample rate (e.g. "MacBook Pro Speakers — 48.0 kHz"), with the Bug-A badge when applicable.
 4. **Live meters** — per-channel peak + RMS bars, refreshed at 20 Hz from the drain thread's atomic meter snapshot (Section 5); shows the "cal" badge when displaying calibration-compensated values; hosts the clip indicator (3.7).
 5. **Elapsed time** and current session size on disk.
@@ -176,7 +172,7 @@ Status-item icon: a template waveform glyph; while recording it gains a red reco
 | Tab | Contents |
 |---|---|
 | **General** | Recordings folder (default `~/Music/TapDeck/`), session naming template with token reference (`{date} {time} {source} {app} {device} {rate}`), Dock-icon toggle, hotkey editor |
-| **Recording** | Default source, device policy (follow default / fixed + picker), timeline policy (`preserveWallClock` default / `compressTimeline`), Silent-capture toggle, optional segment duration/size caps (default OFF) |
+| **Recording** | Exclusion-list editor, device policy (follow default / fixed + picker), timeline policy (`preserveWallClock` default / `compressTimeline`), Silent-capture toggle, optional segment duration/size caps (default OFF) |
 | **Formats & Export** | Default export presets, dither policy, compensation policy ("Bake compensation into master" lives here, default OFF, with its sample-modification warning) |
 | **Automation** | Shell hooks (3.11), triggers and schedules (3.12) |
 | **Advanced** | Buffer frame size (512 default, 128–4096), watchdog thresholds group (Section 8 defaults), Forced-rate mode with the verbatim warning from Section 7 ("Forcing a rate different from the output device's current rate makes macOS resample the audio before TapDeck can capture it. Only use this if you need a fixed rate more than you need maximum fidelity."), Calibration manager (per-device profiles, re-run, delete), Diagnostics/log export |
@@ -197,7 +193,7 @@ Shared exit codes: **0** ok · **2** permission denied · **3** device/app not f
 
 | Verb | Behavior |
 |---|---|
-| `tapdeck record [--system \| --app <bundle-id> ...] [--multitrack] [--device <uid\|name>] [--out <dir>] [--duration <sec>] [--max-silence-stop <sec>]` | Records until Ctrl-C, `--duration` elapses, or silence-stop fires. Default source is `--system`. `--multitrack` requires ≥ 2 `--app` values. `--max-silence-stop N` stops after N continuous seconds of digital silence — counted only while the ZeroWatchdog does NOT classify the zeros as a dropout (a confirmed dropout triggers rebuild, not stop). Prints the session path on exit. |
+| `tapdeck record [--device <uid\|name>] [--out <dir>] [--duration <sec>] [--max-silence-stop <sec>]` | Records the global system mix until Ctrl-C, `--duration` elapses, or silence-stop fires. `--max-silence-stop N` stops after N continuous seconds of digital silence — counted only while the ZeroWatchdog does NOT classify the zeros as a dropout (a confirmed dropout triggers rebuild, not stop). Prints the session path on exit. |
 | `tapdeck devices [--json]` | Output devices with UID, channel count, current nominal rate, and a Bug-A risk flag for > 2 output channels. |
 | `tapdeck apps [--json]` | Running audio-capable processes: bundle id, PID, name, is-outputting-now. |
 | `tapdeck sessions [--json]` | Library index from `SessionStore`: path, date, source, duration, health flags. |
@@ -214,17 +210,16 @@ Runtime events during `tapdeck record` mirror the GUI: every event that would po
 
 The GUI app registers `tapdeck://` (CFBundleURLTypes):
 
-- `tapdeck://record/start?source=system` — start a system-mix recording with current settings.
-- `tapdeck://record/start?app=com.spotify.client` — start recording that app (repeatable `app` parameter for a set).
+- `tapdeck://record/start` — start a system-mix recording with current settings.
 - `tapdeck://record/stop` — graceful stop.
 
-If a recording is already running, `start` is ignored and a notification explains why. URLs drive the GUI app's engine only (no IPC to CLI sessions). Multi-app starts via the URL scheme and via App Intents always record **mixed** (`multiTrack: false`) in v1; multi-track is available only through the GUI picker and the CLI `--multitrack` flag.
+If a recording is already running, `start` is ignored and a notification explains why. URLs drive the GUI app's engine only (no IPC to CLI sessions).
 
 ### 3.10 App Intents (Shortcuts)
 
 Three intents, exposed via the AppIntents framework from the GUI app:
 
-- **Start Recording** — parameters: source (System Audio / app picker), optional device.
+- **Start Recording** — parameters: optional device.
 - **Stop Recording** — no parameters; returns the finalized session path.
 - **Get Recording Status** — returns: recording yes/no, elapsed seconds, source description, health state string.
 
@@ -243,7 +238,7 @@ Environment variables provided: `TAPDECK_SESSION_PATH` (always), `TAPDECK_SEGMEN
 Both trigger types live in Settings → Automation and are executed by `TriggerEngine`:
 
 - **Schedule rules**: start at time T for duration D, with optional weekday repeat. If a rule fires while a recording is already running, the rule is skipped and a notification says so (no queuing in v1).
-- **App-activity auto-record**: armed per app. While any trigger is armed, `ProcessCatalog` polls `kAudioProcessPropertyIsRunningOutput` at 1 Hz; recording starts on the first `true` poll and stops after `hangTime` (default 10 s, configurable) of continuous no-output. A fired app trigger starts a single-lane `.appSet(apps: [thatApp], multiTrack: false)` session using the current default device policy and recording settings. If any recording is already running when an app trigger fires (manual, scheduled, or another armed app), the trigger is skipped with a notification — same policy as schedule rules — and may fire again once the engine is idle and the app is still outputting. **Documented limitation, shown in the arming UI**: because detection is a 1 Hz poll and there is no pre-roll in v1, up to ~1 s of audio lead-in may be missed at the start.
+- **App-activity auto-record**: armed per app. While any trigger is armed, `ProcessCatalog` polls `kAudioProcessPropertyIsRunningOutput` at 1 Hz; recording starts on the first `true` poll and stops after `hangTime` (default 10 s, configurable) of continuous no-output. A fired app trigger starts a normal global system-mix session using the current device policy and recording settings — the armed app is only what starts/stops the recording, not what's isolated within it (there is no per-app isolation, Section 3.4). If any recording is already running when an app trigger fires (manual, scheduled, or another armed app), the trigger is skipped with a notification — same policy as schedule rules — and may fire again once the engine is idle and the app is still outputting. **Documented limitation, shown in the arming UI**: because detection is a 1 Hz poll and there is no pre-roll in v1, up to ~1 s of audio lead-in may be missed at the start.
 
 Trigger-started and trigger-stopped sessions always post notifications (3.7).
 
@@ -278,9 +273,9 @@ tapdeck ------+
 
 These names are canonical; use them exactly as type names.
 
-- **`CaptureEngine`** — top-level orchestrator. Accepts a `SessionSpec` — source variant + device policy + per-lane tap config, normatively defined in Sections 3.4–3.5 — asks `SessionStore` to create the session folder + manifest, computes the lane plan (4.6), creates and owns the `CaptureLane` instances, and runs the session lifecycle (start, stop, finalize). Owns the **engine queue** (4.4) on which every Core Audio hardware call in the process is serialized. Exposes async start/stop with completion callbacks and a polled status snapshot; callers (GUI/CLI) never block on it.
+- **`CaptureEngine`** — top-level orchestrator. Accepts a `SessionSpec` — exclusion list + device policy + tap config, normatively defined in Sections 3.4–3.5 — asks `SessionStore` to create the session folder + manifest, creates and owns the single `CaptureLane` instance (4.6), and runs the session lifecycle (start, stop, finalize). Owns the **engine queue** (4.4) on which every Core Audio hardware call in the process is serialized. Exposes async start/stop with completion callbacks and a polled status snapshot; callers (GUI/CLI) never block on it.
 
-- **`CaptureLane`** — one independent capture pipeline: tap + private aggregate device + IOProc + `td_ring_t` ring + drain thread + segment writer + watchdog. Multi-track = N lanes (4.6). Each lane runs the **lane state machine** (`IDLE → PREPARING → RUNNING ⇄ REBUILDING`, etc.) fully specified in Section 8. A lane owns its per-lane instances of `TapFactory` products, `IOProcHost`, `DrainLoop`, `SegmentWriter`, and `ZeroWatchdog`.
+- **`CaptureLane`** — the single capture pipeline: tap + private aggregate device + IOProc + `td_ring_t` ring + drain thread + segment writer + watchdog (4.6). Runs the **lane state machine** (`IDLE → PREPARING → RUNNING ⇄ REBUILDING`, etc.) fully specified in Section 8. Owns its instances of `TapFactory` products, `IOProcHost`, `DrainLoop`, `SegmentWriter`, and `ZeroWatchdog`.
 
 - **`TapFactory`** — creates and destroys the `CATapDescription`, the process tap, and the private aggregate device. It owns the exact creation recipe (4.5) and executes the strict teardown order (canonical spec in Section 8). No other module ever calls `AudioHardwareCreateProcessTap`, `AudioHardwareCreateAggregateDevice`, or their destroy counterparts.
 
@@ -328,9 +323,9 @@ These names are canonical; use them exactly as type names.
      |  EVERY AudioHardware*/AudioDevice*/AudioObject* call in the  |
      |  process runs on it -- sole exception: the IOProc callback   |
      +--------+-----------------------------------------------------+
-              | owns 1..N lanes   (multi-track = N independent lanes)
+              | owns the single capture lane
               v
-     +---------------------- CaptureLane #i ------------------------+
+     +---------------------- CaptureLane ----------------------------+
      |                                                              |
      |  TapFactory ------> process tap + private aggregate device   |
      |       |                                                      |
@@ -384,7 +379,7 @@ Why the rule exists:
 This is the per-lane creation sequence. All seven steps run on the engine queue, in this order, inside the lane's `PREPARING` state (on any OSStatus error: retry once after 250 ms, then transition to `FAILED` with the OSStatus surfaced — Section 8).
 
 1. **Resolve the target device.** From the `SessionSpec` device policy (Section 7): obtain the output device's `AudioObjectID` and its device UID string; read `kAudioDevicePropertyNominalSampleRate` and the output channel count. The nominal rate is the expected capture rate (never assumed or hardcoded — Section 7); the channel count feeds the Bug-A heuristic (Section 8).
-2. **Build the `CATapDescription`** per the lane's source (Section 3 source model), using the matching initializer: `CATapDescription(stereoGlobalTapButExcludeProcesses:)` for the system-mix source (always excluding TapDeck's own PID); `CATapDescription(stereoMixdownOfProcesses:)` for the default stereo-mixdown app-set case; and the non-mixdown per-process initializer (`CATapDescription(processes:)`) for the advanced `matchDeviceLayout` mode (the exact selector spellings must be confirmed against the CATapDescription header at build time — Section 11, R6). Set: a human-readable name, mixdown behavior (default stereo mixdown; `matchDeviceLayout` advanced option), mute behavior (`.unmuted` default, `.mutedWhenTapped` for silent capture), and **private = true**.
+2. **Build the `CATapDescription`** using `CATapDescription(stereoGlobalTapButExcludeProcesses:)` — always a global stereo tap, always excluding TapDeck's own PID plus the user's exclusion list (Section 3.4). Set: a human-readable name, mute behavior (`.unmuted` default, `.mutedWhenTapped` for silent capture), and **private = true**.
 3. **Create the tap:** `AudioHardwareCreateProcessTap(description) → tapID`. Immediately read back `kAudioTapPropertyUID` (needed for step 4) and `kAudioTapPropertyFormat` (the ASBD that is ground truth for all IOProc data — Section 5; assert its rate matches step 1's nominal rate, and if not, log and trust the tap format — Section 7).
 4. **Build the aggregate-device composition dictionary** with exactly these keys, then call `AudioHardwareCreateAggregateDevice(dictionary) → aggID`:
    - `kAudioAggregateDeviceNameKey` : `"TapDeck Capture <lane-slug>"`
@@ -403,34 +398,24 @@ Teardown is the exact reverse discipline and is canonical in Section 8; stated o
 
 ### 4.6 Lane multiplicity
 
-The lane plan is computed by `CaptureEngine` from the `SessionSpec` source (Section 3):
+Every `SessionSpec` produces exactly **one lane**, slug `mix`: a single global tap with exclusions (Section 3.4). `CaptureEngine` builds it directly — there is no lane-plan computation, since there is nothing left to plan.
 
-- `.systemMix` → exactly **one lane**, slug `mix`, global tap with exclusions.
-- `.appSet(multiTrack: false)` → exactly **one lane**: a single tap whose `CATapDescription` targets *all* selected process objects; the OS delivers one mixed stream.
-- `.appSet(multiTrack: true)` → **one lane per selected app**. Multi-track is nothing more than N independent lanes.
-
-Each lane is a complete, self-contained stack: its own `CATapDescription`, tap, private aggregate device, IOProc, `td_ring_t` ring, `DrainLoop` thread, `SegmentWriter` (writing into its own `<lane-slug>/` subfolder, Section 6), and `ZeroWatchdog`. Lanes share nothing except the engine queue and the session folder/manifest. There is no hard lane cap in v1; per-lane cost is linear — one HAL IOProc, one drain thread, and one ring (8 s capacity, e.g. 4 MiB at 48 kHz stereo — Section 5).
-
-Per-lane independence has three architectural consequences:
-
-1. **Isolation of failure.** A Bug-B dropout or `FAILED` state in one lane rebuilds or fails only that lane; sibling lanes keep recording uninterrupted.
-2. **Fan-out of device events.** When lanes share a target device and `DeviceObserver` reports a device switch or rate change, the event fans out to every affected lane; each lane's rebuild runs as its own serialized task on the engine queue (they rebuild sequentially, never concurrently).
-3. **Time alignment is metadata, not clocking magic.** Lanes on the same device already share the device clock; cross-lane alignment uses each segment's first-buffer host time (`mHostTime`) recorded in the manifest (Sections 5 and 6). No cross-lane buffer synchronization exists at capture time.
+An earlier revision of this design supported multiple lanes (`multiTrack`, one `CaptureLane` per selected app, with cross-lane alignment via each segment's first-buffer host time). That mode was removed along with per-app capture (Section 3.4); it is documented here only because `CaptureLane` itself remains a self-contained, independently-rebuildable stack (its own `CATapDescription`, tap, private aggregate device, IOProc, `td_ring_t` ring, `DrainLoop` thread, `SegmentWriter`, and `ZeroWatchdog`) — nothing architecturally prevents `CaptureEngine` from owning more than one again, it just never needs to.
 
 ---
 
 ## 5. Data Flow
 
-This section traces one sample from the OS mix to bytes on disk, and pins down exactly which thread is allowed to do what. Every lane (`CaptureLane`, Section 4) owns one complete instance of this pipeline; multi-track sessions simply run N independent copies of it.
+This section traces one sample from the OS mix to bytes on disk, and pins down exactly which thread is allowed to do what. The single lane (`CaptureLane`, Section 4) owns one complete instance of this pipeline.
 
 ### 5.1 Thread inventory
 
-There are exactly four **kinds** of execution context. The IOProc thread and DrainLoop Thread are instantiated once per lane (a multi-track session with N lanes has N of each); the engine queue and main thread are process-wide. Nothing else may touch capture data.
+There are exactly four **kinds** of execution context. The IOProc thread and DrainLoop Thread are instantiated once, for the single lane; the engine queue and main thread are process-wide. Nothing else may touch capture data.
 
 | Context | Owner / creation | Cadence | Allowed | Forbidden |
 |---|---|---|---|---|
-| **HAL real-time IOProc thread** (one per lane) | Core Audio; delivered because `IOProcHost` passes a NULL dispatch queue to `AudioDeviceCreateIOProcIDWithBlock` | Every device I/O cycle (nominally 512 frames, see Section 4 recipe step 5) | The three operations in §5.2, executed by `TapDeckRT` C functions only | Locks, allocation, Swift/ObjC runtime, logging, syscalls, file I/O — anything not in §5.2 |
-| **DrainLoop Thread** (one per lane) | `DrainLoop`, a dedicated `Thread` at QoS `.userInitiated` | 50 ms poll cycle | Ring reads, vDSP zero-scan and metering, interleave, synchronous `ExtAudioFileWrite`, watchdog bookkeeping, meter-snapshot publication | Any `AudioHardware*` lifecycle call; UI work |
+| **HAL real-time IOProc thread** (one, for the lane) | Core Audio; delivered because `IOProcHost` passes a NULL dispatch queue to `AudioDeviceCreateIOProcIDWithBlock` | Every device I/O cycle (nominally 512 frames, see Section 4 recipe step 5) | The three operations in §5.2, executed by `TapDeckRT` C functions only | Locks, allocation, Swift/ObjC runtime, logging, syscalls, file I/O — anything not in §5.2 |
+| **DrainLoop Thread** (one, for the lane) | `DrainLoop`, a dedicated `Thread` at QoS `.userInitiated` | 50 ms poll cycle | Ring reads, vDSP zero-scan and metering, interleave, synchronous `ExtAudioFileWrite`, watchdog bookkeeping, meter-snapshot publication | Any `AudioHardware*` lifecycle call; UI work |
 | **Engine queue** (one per process) | `CaptureEngine`'s dedicated serial dispatch queue | Event-driven | All Core Audio object lifecycle (create/start/stop/destroy of taps, aggregates, IOProcs), `ZeroWatchdog` rebuild execution (state transitions run on the drain thread, Section 8), `DeviceObserver` callbacks (dispatched onto it), handing event records to `SessionStore` (which serializes manifest file I/O on its own dedicated serial queue) | Touching ring payload; blocking on the DrainLoop |
 | **Main thread** | AppKit/SwiftUI | UI events; 20 Hz meter poll timer | Reading the published meter snapshot, all UI, notifications | Everything else in this section |
 
@@ -455,7 +440,7 @@ A single-producer / single-consumer **byte** ring in the `TapDeckRT` C library. 
 - **Whole-frame framing**: the payload is raw sample bytes with no headers. The writer only ever writes whole frames; the reader only ever reads whole frames (both sides operate in multiples of bytesPerFrame), so the logical stream is always frame-aligned. In planar mode both sides additionally operate in multiples of one whole callback chunk — itself a whole-frame multiple — per the layout rule in the next bullet.
 - **Tap-native-layout-in-ring invariant**: the ring always contains the tap ASBD's **native layout**, and `td_ring_write` is always a plain bounded byte copy — never a sample reordering. Interleaving is the DrainLoop Thread's job (§5.4 step 5), per the fidelity rules in Section 7. Two cases:
   - **Interleaved tap format** (the expected case — `kAudioTapPropertyFormat` reports interleaved Float32): the AudioBufferList carries one buffer; `td_ring_write` copies its bytes verbatim. Any whole-frame count is accepted; no chunk-boundary knowledge is needed downstream, and drain step 5 is a no-op.
-  - **Non-interleaved (planar) tap format** (possible only under `matchDeviceLayout`, Section 7): the AudioBufferList carries one buffer per channel plane. `td_ring_write` copies the planes **back-to-back in channel order** (all of plane 0's bytes, then all of plane 1's, …) as one all-or-nothing chunk — still plain sequential byte copies, one per plane, with no per-sample striding. The chunk's byte count is frames × channels × 4 = a whole-frame multiple, so the byte-level framing invariant is preserved. **Deterministic parseability rule**: in planar mode every ring chunk is exactly `framesPerCallback` frames, where `framesPerCallback` = the aggregate's `kAudioDevicePropertyBufferFrameSize` (512 default; Section 4 recipe step 5), recorded in the C context at lane build. The drain therefore reads and deinterleaves in exact multiples of one callback chunk (framesPerCallback × channels × 4 bytes) with no headers in the stream. If a planar-mode callback ever delivers a different frame count (not expected from a HAL IOProc running with a fixed buffer frame size), the producer must not write an unparseable chunk: it drops the whole chunk via the standard drop-all-or-nothing path (`droppedChunks` += 1, `droppedFrames` += chunk frames; the drain logs the resulting `overrunGap` event, §5.4 step 7).
+  - **Non-interleaved (planar) tap format** (not expected in practice now that `matchDeviceLayout` and per-app capture are gone, Section 3.4 — the only tap TapDeck builds is the global stereo-mixdown tap, which reports interleaved Float32; this path is retained defensively in case that assumption ever proves wrong on some device/OS combination): the AudioBufferList carries one buffer per channel plane. `td_ring_write` copies the planes **back-to-back in channel order** (all of plane 0's bytes, then all of plane 1's, …) as one all-or-nothing chunk — still plain sequential byte copies, one per plane, with no per-sample striding. The chunk's byte count is frames × channels × 4 = a whole-frame multiple, so the byte-level framing invariant is preserved. **Deterministic parseability rule**: in planar mode every ring chunk is exactly `framesPerCallback` frames, where `framesPerCallback` = the aggregate's `kAudioDevicePropertyBufferFrameSize` (512 default; Section 4 recipe step 5), recorded in the C context at lane build. The drain therefore reads and deinterleaves in exact multiples of one callback chunk (framesPerCallback × channels × 4 bytes) with no headers in the stream. If a planar-mode callback ever delivers a different frame count (not expected from a HAL IOProc running with a fixed buffer frame size), the producer must not write an unparseable chunk: it drops the whole chunk via the standard drop-all-or-nothing path (`droppedChunks` += 1, `droppedFrames` += chunk frames; the drain logs the resulting `overrunGap` event, §5.4 step 7).
 - **Overflow — drop-all-or-nothing**: before copying, the producer computes free space; if the incoming chunk does not fit **entirely**, nothing is written: `droppedChunks` += 1, `droppedFrames` += chunk frame count. Partial frames or partial chunks are never written, so the ring can never contain a torn frame. The drain detects counter deltas and logs `overrunGap` events (§5.4 step 7).
 
 ### 5.4 Drain cycle, step by step
@@ -542,7 +527,7 @@ The canonical ASBD (both sides, identical):
 | `mSampleRate` | effective IOProc rate (Float64): tap-native rate from `kAudioTapPropertyFormat`, or in forced-rate mode the forced rate R from the aggregate stream's virtual format (Section 7.6); e.g. 48000.0 |
 | `mFormatID` | `kAudioFormatLinearPCM` |
 | `mFormatFlags` | `kAudioFormatFlagIsFloat \| kAudioFormatFlagIsPacked` (native-endian; **no** `kAudioFormatFlagIsNonInterleaved`) |
-| `mChannelsPerFrame` | lane channel count (2 for default stereo mixdown; device count for `matchDeviceLayout`) |
+| `mChannelsPerFrame` | lane channel count (2 — the global tap is always a stereo mixdown) |
 | `mBitsPerChannel` | 32 |
 | `mBytesPerFrame` | 4 × `mChannelsPerFrame` |
 | `mFramesPerPacket` | 1 |
@@ -560,10 +545,10 @@ If the tap delivers non-interleaved buffers, the DrainLoop interleaves them (pur
 
 - **Recordings root:** `~/Music/TapDeck/` (user-configurable in Settings → General). Session folders are direct children of the root.
 - **Session folder name template** (configurable; default): `{date} {time} — {source}` → e.g. `2026-07-14 09.41.03 — Spotify`.
-  - Tokens: `{date}` = local date `YYYY-MM-DD`; `{time}` = local time `HH.MM.SS` (dots, not colons — colons are illegal in macOS filenames); `{source}` = "System Audio" for `.systemMix`, the app display name for a single-app `.appSet`, or `"<first app> +N"` for multi-app sets; `{app}` = primary app display name ("System Audio" if none); `{device}` = target device name; `{rate}` = nominal rate at session start formatted as `48kHz` / `44.1kHz` / `192kHz`.
+  - Tokens: `{date}` = local date `YYYY-MM-DD`; `{time}` = local time `HH.MM.SS` (dots, not colons — colons are illegal in macOS filenames); `{source}` / `{app}` = always "System Audio"; `{device}` = target device name; `{rate}` = nominal rate at session start formatted as `48kHz` / `44.1kHz` / `192kHz`.
   - Sanitization: replace `/`, `:`, and control characters with `-`; collapse runs of whitespace; trim; cap at **200 bytes of UTF-8** (bytes, not characters — truncate only at a character boundary so no code point is split). On collision, append ` (2)`, ` (3)`, ….
 - **Inside a session folder:**
-  - One subfolder per lane, named by **lane slug**: the app's bundle-id short name — the last dot-component of the bundle id, lowercased (e.g. `com.spotify.client` → `client`); for PID-only selectors with no bundle id, the process name lowercased with non-alphanumerics collapsed to `-`; `mix` for system-mix lanes and for single mixed lanes (`multiTrack=false`). Slug collisions between lanes get `-2`, `-3` suffixes in lane-index order.
+  - One subfolder for the lane, named `mix` (the only lane slug there is).
   - Segments: `<lane-slug>/segment-001.caf`, `segment-002.caf`, … — zero-padded to 3 digits (widening naturally past 999), 1-based, monotonically increasing per lane.
   - `session.json` — the manifest (Section 6.4).
   - `.recording.lock` — advisory liveness lock containing the writer process's PID; present only while a recording process holds the session open (created/removed per Section 6.5).
@@ -593,11 +578,9 @@ One JSON object per session. All timestamps are ISO-8601 strings with millisecon
 | `createdAt` | string | Timestamp of session creation. |
 | `finalizedAt` | string \| null | Set when FINALIZING completes (Section 8), or by the crash-recovery scan (which also sets `recovered: true`; Section 6.5). **Null/absent means the session is unfinalized — the crash marker** that drives the recovery scan. |
 | `recovered` | boolean | Absent or `false` normally; set `true` by the crash-recovery scan. |
-| `sourceType` | string | `"systemMix"` \| `"appSet"`. |
-| `sourceApps` | array of string | Bundle ids requested in the `SessionSpec` (empty for `systemMix`). |
+| `sourceType` | string | Always `"systemMix"`. |
 | `device` | object | `{uid: string, name: string}` — initial target output device. |
 | `deviceHistory` | array | Entries `{uid: string, name: string, fromWallTime: string}`; the initial device is entry 0; a new entry is appended on every `deviceSwitch`. |
-| `multiTrack` | boolean | Mirrors `SessionSpec`. |
 | `timelinePolicy` | string | `"preserveWallClock"` \| `"compressTimeline"` (Section 8 defines the behaviors). |
 
 **`lanes[]` entries**
@@ -606,8 +589,8 @@ One JSON object per session. All timestamps are ISO-8601 strings with millisecon
 |---|---|---|
 | `index` | integer | 0-based lane index. |
 | `slug` | string | Lane slug per Section 6.3; equals the lane's subfolder name. |
-| `kind` | string | `"mix"` (system mix, or multi-app mixed lane) \| `"app"` (one app, multi-track). |
-| `processes` | array | Resolved at lane start: `{bundleId: string \| null, pid: integer, name: string}` per tapped process (`bundleId` null for PID-only selectors). Empty for system-mix lanes. |
+| `kind` | string | Always `"mix"`. |
+| `processes` | array | Always empty — the lane is a global tap, not a set of resolved target processes. |
 | `calibration` | object \| null | `{deviceUID: string, gainCompensationDB: number, measuredAt: string}` — the Bug-A profile matching the lane's current device, or `null` if none (Section 8). Updated on device switch. Master audio is NEVER modified by this value; it is metadata for meters and export. |
 | `segments` | array | See below. |
 | `events` | array | See below. |
@@ -791,9 +774,7 @@ This section is the safety-critical core of TapDeck. It owns the canonical `Zero
 Escalated retries bypass the 0.5/2/5 s backoff schedule — the 60 s cadence is itself the throttle — but each one still counts as an attempt in the sliding 10-minute window, so a failed escalated attempt normally returns straight to `ESCALATED` via the 3-failed-attempts row and re-arms the timer; if the window has aged below 3 attempts, the normal backoff path resumes instead. This loop continues until nonzero audio returns or the user stops the session.
 
 **The corroboration signal.** While any lane's watchdog is in ANY state other than `NORMAL` — i.e. `SUSPICIOUS`, `CONFIRMED_DROPOUT`, `REBUILDING`, `POST_REBUILD_VERIFY`, or `ESCALATED` — `ProcessCatalog` polls at 1 Hz answering "is any relevant process currently outputting audio?" via `kAudioProcessPropertyIsRunningOutput` on each process object from `kAudioHardwarePropertyProcessObjectList`. Polling must cover the entire dropout episode — not just `SUSPICIOUS` — because the state table above consumes LIVE corroboration outside `SUSPICIOUS`: the `POST_REBUILD_VERIFY` exits ("no one is playing" → `SUSPICIOUS`; "corroborated zeros ≥ 10 s" → next attempt) and each `ESCALATED` retry decision all depend on it. Polling stops only when the watchdog returns to `NORMAL`. This same trigger condition — watchdog in any non-`NORMAL` state — appears in `ProcessCatalog`'s trigger list (see Section 4).
-- For `.systemMix` lanes: check all processes EXCLUDING TapDeck's own PID and any processes matching the lane's `excludeBundleIDs` (excluded apps are not captured, so their output must not corroborate a dropout).
-- For `.appSet` lanes (lane-targeted corroboration): check ONLY the lane's target processes (resolved via `kAudioHardwarePropertyTranslatePIDToProcessObject`); an unrelated app playing audio cannot confirm a dropout in a Spotify-only lane.
-A poll is "corroborated" when at least one relevant process reports `IsRunningOutput = true`. The confirm condition requires the latest 3 polls all corroborated.
+Check all processes EXCLUDING TapDeck's own PID and any processes matching the lane's `excludeBundleIDs` (excluded apps are not captured, so their output must not corroborate a dropout). A poll is "corroborated" when at least one relevant process reports `IsRunningOutput = true`. The confirm condition requires the latest 3 polls all corroborated.
 
 **Snapshot freshness rule.** Every published snapshot carries its poll timestamp. A snapshot older than **3 s** is STALE and is treated as unavailable: it never counts as corroborated, and it never counts as evidence that "no one is playing" either. Every watchdog decision that reads corroboration — the SUSPICIOUS confirm, the corroborated `POST_REBUILD_VERIFY` exits, and each `ESCALATED` retry decision — uses only fresh (≤ 3 s old) snapshots. If the snapshot stays stale while the watchdog is outside `NORMAL`, each additional full second of staleness counts as one errored corroboration read toward the "≥ 3 consecutive corroboration reads errored or stale" condition of the two uncorroborated fallback rows (SUSPICIOUS → CONFIRMED_DROPOUT at zero-run ≥ 60 s, and POST_REBUILD_VERIFY → next REBUILDING attempt at ≥ 60 s since the rebuild). In `ESCALATED`, a stale or errored snapshot at timer fire selects action 3 of the escalated retry decision (rebuild anyway). No state can therefore hang waiting for corroboration that never arrives.
 
@@ -1103,11 +1084,8 @@ This register aggregates every "verify hands-on" flag from Sections 4–10. Each
 - *Verify*: run the Section 10 null test twice — once with `true`, once with `false`. The 997 Hz residual (≤ −70 dBFS RMS) and the exactly-zero silence segment prove no SRC; keep whichever setting nulls better.
 - *Fallback*: flip the single dictionary constant to `false` in TapFactory's recipe (Section 4).
 
-**R6 — `matchDeviceLayout` (unmixed) channel behavior.**
-- *Risk*: channel count, ordering, and per-process summing behavior of the unmixed CATapDescription mode are unverified.
-- *Why unresolved*: no authoritative documentation; needs a multichannel device to test.
-- *Verify*: Phase 4 — tap a >2-channel device while playing a known per-channel identification signal; inspect `kAudioTapPropertyFormat` and captured channel contents.
-- *Fallback*: stereo mixdown remains the default and only guaranteed mode; ship `matchDeviceLayout` behind Advanced with an "experimental" label, or cut it from v1 with no other feature impact.
+**R6 — `matchDeviceLayout` (unmixed) channel behavior. RETIRED — feature removed.**
+- `matchDeviceLayout` and the per-app (`.appSet`) capture mode it belonged to were removed entirely (Section 3.4): the only tap TapDeck builds now is `CATapDescription(stereoGlobalTapButExcludeProcesses:)`, whose channel behavior is already exercised by the Section 10.3 null test. Nothing in the shipped design depends on the unmixed per-process tap variant anymore.
 
 **R7 — DRM capture works incidentally.**
 - *Risk*: taps currently capture decoded PCM from FairPlay-protected sources (Apple Music, Netflix, Apple TV+); empirical, not an Apple guarantee, and could stop working in any release.
@@ -1199,13 +1177,15 @@ Deliverable: a recorder that survives device churn and Bug B unattended.
 
 DONE WHEN: the full watchdog simulation suite passes, **including the genuine-silence-forever zero-rebuild case** (10.1.2); manually switching the default output mid-recording yields a new segment + `deviceSwitch` event with capture continuing; changing the device rate in Audio MIDI Setup mid-recording rotates a segment at the new rate; unplugging a `.fixed` device enters `WAITING_FOR_DEVICE` and replugging resumes.
 
-### Phase 4 — Per-app capture & multi-track
+### Phase 4 — Per-app capture & multi-track (historical — later removed)
 
 Tasks: full `ProcessCatalog` (§4 property constants, 1 Hz gated polling); `SessionSpec` `.appSet` sources (single mixed tap for multiple apps; one-lane-per-app when `multiTrack=true`); bundle-id AppSelectors surviving relaunch; per-lane folders/slugs; `mHostTime`-based cross-lane alignment in the manifest; CLI `--app`/`--multitrack`/`tapdeck apps`.
 
 Deliverable: CLI can record one app, several apps mixed, or several apps as separate tracks.
 
 DONE WHEN: recording `com.apple.Music` while a second app plays captures ONLY Music (the other app is absent by ear and by meter); a two-app multitrack session produces two lane folders whose first-buffer host times align the tracks within ±10 ms when loaded into a DAW.
+
+**Post-v1 note:** per-app capture and multi-track (`.appSet`, `AppSelector`, `SessionSpecPlanner`/`LanePlan`, CLI `--app`/`--multitrack`) were removed after this phase shipped — a global tap already captures whatever is playing, and maintaining per-app isolation as a second capture path wasn't worth the surface area (Section 3.4). `ProcessCatalog` and `tapdeck apps` remain, now serving only the exclusion-list editor and app-activity triggers.
 
 ### Phase 5 — GUI app: menu bar, onboarding, Library
 
@@ -1241,7 +1221,7 @@ DONE WHEN: a scripted matrix exercises every CLI verb and asserts documented exi
 
 ### Phase 9 — Hardening & ship
 
-Tasks: run the full Section 10 battery — null test with baseline capture (10.3), Bug-A test (10.4), 24 h Bug-B soak with the 2 h silence window (10.5), permission matrix (10.6), 4 GB+ and crash tests (10.7); re-verify every "verify hands-on" item in §11 on the current macOS build (Bug A/Bug B presence, mic entitlement, settings deep-link anchor, DRM behavior, `matchDeviceLayout` channels); finalize the notarization pipeline on a DMG; optional Sparkle 2 integration; write user docs + the diagnostics guide (`tapdeck diag`).
+Tasks: run the full Section 10 battery — null test with baseline capture (10.3), Bug-A test (10.4), 24 h Bug-B soak with the 2 h silence window (10.5), permission matrix (10.6), 4 GB+ and crash tests (10.7); re-verify every still-open "verify hands-on" item in §11 on the current macOS build (Bug A/Bug B presence, mic entitlement, settings deep-link anchor, DRM behavior — R6 is retired, Section 11); finalize the notarization pipeline on a DMG; optional Sparkle 2 integration; write user docs + the diagnostics guide (`tapdeck diag`).
 
 Deliverable: the notarized, distributable release.
 

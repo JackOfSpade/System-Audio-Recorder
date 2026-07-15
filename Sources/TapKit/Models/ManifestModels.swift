@@ -91,11 +91,9 @@ public struct SessionInfo: Codable, Sendable {
     public var createdAt: String
     public var finalizedAt: String?
     public var recovered: Bool?
-    public var sourceType: String  // "systemMix" | "appSet"
-    public var sourceApps: [String]
+    public var sourceType: String  // always "systemMix"
     public var device: DeviceRef
     public var deviceHistory: [DeviceHistoryEntry]
-    public var multiTrack: Bool
     public var timelinePolicy: String  // "preserveWallClock" | "compressTimeline"
 
     public init(
@@ -105,10 +103,8 @@ public struct SessionInfo: Codable, Sendable {
         finalizedAt: String? = nil,
         recovered: Bool? = nil,
         sourceType: String,
-        sourceApps: [String],
         device: DeviceRef,
         deviceHistory: [DeviceHistoryEntry],
-        multiTrack: Bool,
         timelinePolicy: String
     ) {
         self.id = id
@@ -117,10 +113,8 @@ public struct SessionInfo: Codable, Sendable {
         self.finalizedAt = finalizedAt
         self.recovered = recovered
         self.sourceType = sourceType
-        self.sourceApps = sourceApps
         self.device = device
         self.deviceHistory = deviceHistory
-        self.multiTrack = multiTrack
         self.timelinePolicy = timelinePolicy
     }
 }
@@ -213,7 +207,7 @@ public struct EventEntry: Codable, Sendable {
 public struct LaneEntry: Codable, Sendable {
     public var index: Int
     public var slug: String
-    public var kind: String  // "mix" | "app"
+    public var kind: String  // always "mix"
     public var processes: [ProcessRef]
     public var calibration: CalibrationRef?
     public var segments: [SegmentEntry]

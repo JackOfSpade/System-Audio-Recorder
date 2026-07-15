@@ -173,26 +173,17 @@ public struct ScheduleRule: Sendable, Identifiable, Codable {
 }
 
 /// A `Codable` wire form of `SessionSpec` (which itself isn't Codable, since
-/// it's a plain value type designed for in-process use). Kept intentionally
-/// minimal — system mix or a single-app set, mirroring what the Settings UI
-/// actually exposes for scheduled rules.
+/// it's a plain value type designed for in-process use). Recording is always
+/// a global system-mix tap; the only per-rule knob is the exclusion list.
 public struct SessionSpecCodable: Sendable, Codable {
-    public var isSystemMix: Bool
-    public var appBundleIDs: [String]
-    public var multiTrack: Bool
+    public var excludeBundleIDs: [String]
 
-    public init(isSystemMix: Bool, appBundleIDs: [String], multiTrack: Bool) {
-        self.isSystemMix = isSystemMix
-        self.appBundleIDs = appBundleIDs
-        self.multiTrack = multiTrack
+    public init(excludeBundleIDs: [String] = []) {
+        self.excludeBundleIDs = excludeBundleIDs
     }
 
     public func toSessionSpec() -> SessionSpec {
-        if isSystemMix {
-            return SessionSpec(source: .systemMix(excludeBundleIDs: []))
-        } else {
-            return SessionSpec(source: .appSet(apps: appBundleIDs.map { .bundleID($0) }, multiTrack: multiTrack))
-        }
+        SessionSpec(excludeBundleIDs: excludeBundleIDs)
     }
 }
 
@@ -368,7 +359,10 @@ public final class TriggerEngine {
                             continue
                         }
                         self.armedAppCurrentlyRecording.insert(bundleID)
-                        let spec = SessionSpec(source: .appSet(apps: [.bundleID(bundleID)], multiTrack: false))
+                        // Recording is always the global system mix now — an
+                        // armed app is just what starts/stops it, not what's
+                        // isolated within it.
+                        let spec = SessionSpec()
                         self.delegate?.triggerEngine(self, requestsStart: spec, reason: "app-activity:\(bundleID)")
                     }
                 } else if self.armedAppCurrentlyRecording.contains(bundleID) {

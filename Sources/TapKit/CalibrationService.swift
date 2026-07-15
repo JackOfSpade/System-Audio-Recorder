@@ -135,9 +135,9 @@ public enum CalibrationService {
         let toneURL = try generateToneFile()
         defer { try? FileManager.default.removeItem(at: toneURL) }
 
-        let spec = SessionSpec(source: .systemMix(excludeBundleIDs: []), device: .fixed(deviceUID: deviceUID))
+        let spec = SessionSpec(device: .fixed(deviceUID: deviceUID))
         let handle = try TapFactory.create(
-            spec: spec, laneSlug: "calibration", laneApps: [], excludeProcessIDs: [], bufferFrameSize: 512
+            spec: spec, laneSlug: "calibration", excludeProcessIDs: [], bufferFrameSize: 512
         )
         defer { TapFactory.destroy(handle) }
 
