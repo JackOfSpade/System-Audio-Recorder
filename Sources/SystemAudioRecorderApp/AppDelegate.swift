@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import TapKit
 
 /// AppDelegate owns the status item and the two windows (Library, Settings);
 /// each window hosts a SwiftUI root view via `NSHostingController` (Section
@@ -17,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let toggleRecordHotkeyID: UInt32 = 1
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.start()
+        Log.info("System Audio Recorder launched (GUI)")
         appState = AppState()
         NSApp.setActivationPolicy(.accessory) // LSUIElement-equivalent at runtime
 

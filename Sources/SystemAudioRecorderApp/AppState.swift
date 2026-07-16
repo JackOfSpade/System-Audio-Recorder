@@ -111,6 +111,8 @@ final class AppState: ObservableObject {
                 self.elapsedSeconds = 0
                 if let fileURL {
                     self.lastEventDescription = "Saved: \(fileURL.lastPathComponent)"
+                } else {
+                    self.lastEventDescription = "Recording failed to save — see \(Log.fileURL.path)"
                 }
                 completion?()
             }

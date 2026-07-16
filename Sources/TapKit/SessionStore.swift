@@ -159,7 +159,7 @@ public final class SessionStore {
                 // Previously encode failures were swallowed by `try?` with no
                 // logging at all, unlike the write/rename failure below —
                 // silently dropping the entire manifest update on the floor.
-                FileHandle.standardError.write("System Audio Recorder: manifest write failed: \(error)\n".data(using: .utf8)!)
+                Log.error("manifest write failed: \(error)")
             }
             completion?()
         }

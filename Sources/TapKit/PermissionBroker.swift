@@ -56,6 +56,7 @@ public enum PermissionBroker {
             outcome = .granted
         } else {
             outcome = .notGranted
+            Log.error("capture permission probe failed (OSStatus \(status)) — treating as not granted")
         }
         cachedOutcome = outcome
         return outcome

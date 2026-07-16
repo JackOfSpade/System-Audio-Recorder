@@ -152,10 +152,12 @@ public final class CaptureLane {
             // to them once we retry.
             teardownCoreAudioObjectsOnly()
             if !isRetry {
+                Log.error("lane \(slug): start attempt failed, retrying once in 250ms: \(error)")
                 engineQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                     self?.prepareAndStart(isRetry: true, completion: completion)
                 }
             } else {
+                Log.error("lane \(slug): start failed after retry: \(error)")
                 state = .failed("\(error)")
                 completion(.failure(error))
             }

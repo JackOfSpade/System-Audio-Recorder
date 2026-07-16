@@ -230,7 +230,7 @@ public final class DrainLoop {
                 }
             }
         } catch {
-            FileHandle.standardError.write("System Audio Recorder: segment write failed: \(error)\n".data(using: .utf8)!)
+            Log.error("segment write failed: \(error)")
         }
         framePosition += Int64(frameCount)
 

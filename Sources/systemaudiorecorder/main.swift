@@ -325,6 +325,9 @@ func runCalibrate(_ parser: ArgParser) -> Never {
 
 // MARK: entry point
 
+Log.start()
+Log.info("System Audio Recorder launched (CLI): \(CommandLine.arguments.dropFirst().joined(separator: " "))")
+
 let allArgs = Array(CommandLine.arguments.dropFirst())
 guard let verb = allArgs.first else {
     fail(.usage, "usage: systemaudiorecorder <record|devices|apps|calibrate> [options]")

@@ -112,6 +112,7 @@ public final class CaptureEngine {
         group.notify(queue: engineQueue) { [weak self] in
             guard let self else { return }
             if let firstError {
+                Log.error("start(): lane failed to start: \(firstError)")
                 let stopGroup = DispatchGroup()
                 for lane in self.lanes {
                     stopGroup.enter()
@@ -127,6 +128,7 @@ public final class CaptureEngine {
                     completion(.failure(firstError))
                 }
             } else {
+                Log.info("start(): recording started")
                 self.status = .recording
                 self.onStatusChanged?(self.status)
                 completion(.success(()))
@@ -160,7 +162,8 @@ public final class CaptureEngine {
                       let spec = self.currentSpec,
                       let namingTemplate = self.currentNamingTemplate,
                       let asbd = lane.effectiveASBD else {
-                    self.finishStop(fileURL: nil, completion: completion)
+                    Log.error("stop(): no lane/spec/ASBD available to export — nothing was captured")
+                    self.finishStop(fileURL: nil, error: "No audio was captured to save", completion: completion)
                     return
                 }
 
@@ -195,11 +198,12 @@ public final class CaptureEngine {
                     )
 
                     try? FileManager.default.removeItem(at: tempURL)
+                    Log.info("stop(): exported recording to \(finalURL.path)")
                     self.finishStop(fileURL: finalURL, completion: completion)
                 } catch {
-                    FileHandle.standardError.write("System Audio Recorder: failed to export: \(error)\n".data(using: .utf8)!)
+                    Log.error("stop(): failed to export: \(error)")
                     try? FileManager.default.removeItem(at: tempURL)
-                    self.finishStop(fileURL: nil, completion: completion)
+                    self.finishStop(fileURL: nil, error: "Failed to export recording: \(error)", completion: completion)
                 }
             }
         }
@@ -241,13 +245,13 @@ public final class CaptureEngine {
         }
     }
 
-    private func finishStop(fileURL: URL?, completion: @escaping (URL?) -> Void) {
+    private func finishStop(fileURL: URL?, error: String? = nil, completion: @escaping (URL?) -> Void) {
         self.lanes = []
         self.laneDelegates = []
         self.currentSpec = nil
         self.currentNamingTemplate = nil
-        self.status = .idle
-        self.onStatusChanged?(.idle)
+        self.status = error.map { EngineStatus.error($0) } ?? .idle
+        self.onStatusChanged?(self.status)
         completion(fileURL)
     }
 

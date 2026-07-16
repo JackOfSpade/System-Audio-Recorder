@@ -105,7 +105,7 @@ public final class IOProcHost {
         guard let procID else { return }
         let status = AudioDeviceStop(aggregateID, procID)
         if status != noErr {
-            FileHandle.standardError.write("System Audio Recorder: AudioDeviceStop returned \(status); continuing teardown.\n".data(using: .utf8)!)
+            Log.error("AudioDeviceStop returned \(status); continuing teardown.")
         }
     }
 
@@ -114,7 +114,7 @@ public final class IOProcHost {
         guard let procID else { return }
         let status = AudioDeviceDestroyIOProcID(aggregateID, procID)
         if status != noErr {
-            FileHandle.standardError.write("System Audio Recorder: AudioDeviceDestroyIOProcID returned \(status); continuing teardown.\n".data(using: .utf8)!)
+            Log.error("AudioDeviceDestroyIOProcID returned \(status); continuing teardown.")
         }
         self.procID = nil
     }

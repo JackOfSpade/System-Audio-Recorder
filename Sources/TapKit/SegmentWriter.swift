@@ -18,10 +18,17 @@ public final class SegmentWriter {
 
     private(set) public var current: OpenSegment?
     public private(set) var data = Data()
+    /// The ASBD of the most recently opened segment. Kept separate from
+    /// `current` (cleared by `finalizeCurrentSegment()`) because callers —
+    /// `CaptureEngine.stop()` in particular — need the format AFTER the
+    /// session has already been finalized, to write out `data` as the final
+    /// file. Never cleared: `asbd` must still answer correctly post-stop.
+    private var lastOpenedASBD: AudioStreamBasicDescription?
 
-    /// The ASBD of the currently open segment, or nil if no segment is open.
+    /// The ASBD of the currently open segment, or — once finalized — the
+    /// last segment that was open. Nil only if no segment was ever opened.
     public var asbd: AudioStreamBasicDescription? {
-        current?.asbd
+        current?.asbd ?? lastOpenedASBD
     }
 
     public init() {
@@ -44,13 +51,17 @@ public final class SegmentWriter {
         )
     }
 
-    /// Prepares the in-memory buffer.
+    /// Prepares the in-memory buffer. Does NOT reset `data` — a fresh
+    /// `SegmentWriter` already starts with an empty buffer, and a later call
+    /// (a device-switch/rate-change rebuild opening its next segment) must
+    /// keep appending to the same master buffer, not discard everything
+    /// captured before the rotation.
     @discardableResult
     public func openNextSegment(asbd: AudioStreamBasicDescription) throws -> OpenSegment {
         let url = URL(fileURLWithPath: "/dummy/segment.caf")
         let segment = OpenSegment(url: url, index: 1, asbd: asbd, framesWritten: 0)
         current = segment
-        data = Data()
+        lastOpenedASBD = asbd
         return segment
     }
 
@@ -74,7 +85,7 @@ public final class SegmentWriter {
     @discardableResult
     public func finalizeCurrentSegment() -> FinalizeResult {
         guard let segment = current else {
-            FileHandle.standardError.write("System Audio Recorder: finalizeCurrentSegment called with no open segment\n".data(using: .utf8)!)
+            Log.error("finalizeCurrentSegment called with no open segment")
             return FinalizeResult(frames: 0, succeeded: false)
         }
         let frames = segment.framesWritten

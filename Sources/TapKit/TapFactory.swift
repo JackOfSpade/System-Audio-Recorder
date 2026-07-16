@@ -56,9 +56,7 @@ public enum TapFactory {
         if tapFormat.mSampleRate != nominalRate {
             // Section 7.2: mismatch is logged, never fatal — the tap format
             // is trusted over the device property.
-            FileHandle.standardError.write(
-                "System Audio Recorder: tap format rate \(tapFormat.mSampleRate) != device nominal rate \(nominalRate); trusting tap format.\n".data(using: .utf8)!
-            )
+            Log.error("tap format rate \(tapFormat.mSampleRate) != device nominal rate \(nominalRate); trusting tap format.")
         }
 
         // Step 4: build the aggregate composition dictionary with EXACTLY
@@ -117,15 +115,11 @@ public enum TapFactory {
     public static func destroy(_ handle: TapHandle) {
         let aggStatus = AudioHardwareDestroyAggregateDevice(handle.aggregateID)
         if aggStatus != noErr {
-            FileHandle.standardError.write(
-                "System Audio Recorder: AudioHardwareDestroyAggregateDevice returned \(aggStatus); continuing teardown.\n".data(using: .utf8)!
-            )
+            Log.error("AudioHardwareDestroyAggregateDevice returned \(aggStatus); continuing teardown.")
         }
         let tapStatus = AudioHardwareDestroyProcessTap(handle.tapID)
         if tapStatus != noErr {
-            FileHandle.standardError.write(
-                "System Audio Recorder: AudioHardwareDestroyProcessTap returned \(tapStatus); continuing teardown.\n".data(using: .utf8)!
-            )
+            Log.error("AudioHardwareDestroyProcessTap returned \(tapStatus); continuing teardown.")
         }
     }
 
