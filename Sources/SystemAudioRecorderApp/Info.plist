@@ -21,7 +21,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>System Audio Recorder records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.</string>
+	<string>System Audio Recorder records the system-wide mix of the audio your Mac plays. macOS requires your permission for this.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>System Audio Recorder</string>
 	<key>CFBundleURLTypes</key>

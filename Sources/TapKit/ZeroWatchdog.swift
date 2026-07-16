@@ -87,6 +87,12 @@ public final class ZeroWatchdog {
 
     private var zeroRunStartedAt: Date?
     private var rebuildCompletedAt: Date?
+    /// Sticky kill switch, set by `invalidate()` when the owning lane is
+    /// stopped for good. Every public entry point no-ops afterward — the
+    /// final drain passes that run during teardown must not be able to
+    /// schedule a new rebuild (or fire one synchronously from ESCALATED)
+    /// that would resurrect a lane the caller believes is fully stopped.
+    private var isInvalidated = false
     /// True from the moment this dropout episode first enters ESCALATED
     /// until the episode fully resolves (back to NORMAL, or downgraded to
     /// SUSPICIOUS) — tracked separately from `_state` because by the time a
@@ -95,11 +101,11 @@ public final class ZeroWatchdog {
     /// `_state == .escalated` at that point would always be false and the
     /// deescalate callback would never fire even though escalation is over.
     private var wasEverEscalatedThisEpisode = false
-    /// Driven by the drain cycle's regular ~50 ms cadence (Section 8.1's
-    /// "Where it runs") rather than Foundation's Timer/RunLoop — the
-    /// DrainLoop thread never runs an active run loop, so a scheduled Timer
-    /// would never fire there.
-    private var escalatedRetryDueAt: Date?
+    /// The scheduled 60 s ESCALATED retry, as its own cancellable work item.
+    /// It must NOT be driven by the drain cycle (the previous approach): a
+    /// failed rebuild tears the drain thread down, so a drain-driven retry
+    /// could never fire in exactly the case ESCALATED exists for.
+    private var escalatedRetryWorkItem: DispatchWorkItem?
     /// The currently-scheduled backoff-delayed rebuild request, if any
     /// (Section 8.1's 0.5/2/5s schedule). Cancelling this is what stops a
     /// scheduled-but-not-yet-fired request from resurrecting a lane that's
@@ -112,21 +118,48 @@ public final class ZeroWatchdog {
         self.now = now
     }
 
-    /// Cancels any pending backoff-delayed rebuild request. The owning
-    /// `CaptureLane` calls this when it's being torn down (Section 8.4) —
-    /// without it, a request scheduled just before `stop()` could still
-    /// fire afterward (the async work item held no reference to the lane's
-    /// lifecycle) and resurrect a lane the caller believes is fully stopped.
+    /// Permanently silences this watchdog. The owning `CaptureLane` calls
+    /// this when it's being torn down for good (Section 8.4) — cancelling any
+    /// pending backoff-delayed rebuild AND making every later entry point a
+    /// no-op, so the final teardown drain passes can't re-arm anything.
     public func invalidate() {
         lock.lock(); defer { lock.unlock() }
+        isInvalidated = true
         pendingRebuildWorkItem?.cancel()
         pendingRebuildWorkItem = nil
+        escalatedRetryWorkItem?.cancel()
+        escalatedRetryWorkItem = nil
+    }
+
+    /// An external full rebuild (device switch, rate change, or entering
+    /// waiting-for-device) supersedes any scheduled watchdog work. Cancels
+    /// BOTH work items (the backoff-delayed rebuild AND the 60s ESCALATED
+    /// retry — leaving either armed would tear down the fresh pipeline or
+    /// churn guard-rejected phantom attempts) and resets the episode to
+    /// NORMAL so zeros on the new pipeline re-confirm from scratch. Unlike
+    /// `invalidate()`, the watchdog stays alive for the rebuilt pipeline.
+    /// Cancelling a mid-flight episode without this reset would otherwise
+    /// strand the state machine in `.rebuilding` forever (no
+    /// `rebuildCompleted` will ever arrive for a cancelled work item, and
+    /// `reportZeroRun` ignores `.rebuilding`).
+    public func resetForExternalRebuild() {
+        lock.lock(); defer { lock.unlock() }
+        guard !isInvalidated else { return }
+        reset()
     }
 
     /// Called by `ProcessCatalog` (relayed through the lane) every time a new
     /// 1 Hz poll snapshot is available. Section 8.1 "The corroboration signal".
     public func updateCorroboration(_ snapshot: CorroborationSnapshot) {
         lock.lock(); defer { lock.unlock() }
+        guard !isInvalidated else { return }
+        // The drain loop re-delivers the lane's cached 1 Hz snapshot every
+        // ~50 ms cycle; Section 8.1's "3 consecutive corroborated polls"
+        // means 3 GENUINE polls (~3 s of sustained corroboration), so a
+        // snapshot from the same underlying poll must not count twice.
+        if let last = lastCorroboration, last.polledAt == snapshot.polledAt {
+            return
+        }
         lastCorroboration = snapshot
         let isFresh = now().timeIntervalSince(snapshot.polledAt) <= WatchdogThresholds.snapshotFreshnessSeconds
         if !isFresh || snapshot.errored {
@@ -147,6 +180,7 @@ public final class ZeroWatchdog {
     /// NORMAL from every state, including ESCALATED (Section 8.1).
     public func reportZeroRun(seconds: Double) {
         lock.lock(); defer { lock.unlock() }
+        guard !isInvalidated else { return }
         if seconds == 0 {
             reset()
             return
@@ -165,18 +199,9 @@ public final class ZeroWatchdog {
             evaluateSuspiciousConfirm(zeroRunSeconds: seconds)
         case .postRebuildVerify:
             evaluatePostRebuildVerify(zeroRunSeconds: seconds)
-        case .confirmedDropout, .rebuilding:
-            break // transitions driven by requestRebuild()/rebuildCompleted(), not zero-run polling
-        case .escalated:
-            checkEscalatedRetryDue()
-        }
-    }
-
-    private func checkEscalatedRetryDue() {
-        guard let due = escalatedRetryDueAt, now() >= due else { return }
-        escalatedRetryFired()
-        if _state == .escalated {
-            escalatedRetryDueAt = now().addingTimeInterval(WatchdogThresholds.escalatedRetrySeconds)
+        case .confirmedDropout, .rebuilding, .escalated:
+            break // transitions driven by requestRebuild()/rebuildCompleted()
+                  // and the scheduled ESCALATED retry, not zero-run polling
         }
     }
 
@@ -192,12 +217,13 @@ public final class ZeroWatchdog {
         // a lane that's already healthy again.
         pendingRebuildWorkItem?.cancel()
         pendingRebuildWorkItem = nil
+        escalatedRetryWorkItem?.cancel()
+        escalatedRetryWorkItem = nil
         zeroRunStartedAt = nil
         consecutiveCorroboratedPolls = 0
         consecutiveStaleOrErroredPolls = 0
         attemptTimestamps.removeAll()
         currentAttemptNumber = 0
-        escalatedRetryDueAt = nil
         wasEverEscalatedThisEpisode = false
         _state = .normal
         if shouldDeescalate {
@@ -309,6 +335,7 @@ public final class ZeroWatchdog {
     /// 8.2) completes, success or failure.
     public func rebuildCompleted(success: Bool) {
         lock.lock(); defer { lock.unlock() }
+        guard !isInvalidated else { return }
         guard success else {
             pruneAttemptWindow()
             if attemptTimestamps.count >= WatchdogThresholds.maxAttemptsPerWindow {
@@ -328,7 +355,32 @@ public final class ZeroWatchdog {
         _state = .escalated
         wasEverEscalatedThisEpisode = true
         delegate?.zeroWatchdogDidEscalate(self)
-        escalatedRetryDueAt = now().addingTimeInterval(WatchdogThresholds.escalatedRetrySeconds)
+        scheduleEscalatedRetry()
+    }
+
+    /// Schedules the 60 s ESCALATED retry as its own cancellable work item
+    /// (cancelled by `reset()`/`invalidate()`). `escalatedRetryFired` always
+    /// leaves ESCALATED (to REBUILDING or downgraded to SUSPICIOUS), and any
+    /// later re-entry into ESCALATED re-schedules, so no self-reschedule is
+    /// needed here.
+    private func scheduleEscalatedRetry() {
+        escalatedRetryWorkItem?.cancel()
+        var workItem: DispatchWorkItem!
+        workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard !self.isInvalidated, self.escalatedRetryWorkItem === workItem else {
+                self.lock.unlock()
+                return
+            }
+            self.escalatedRetryWorkItem = nil
+            self.escalatedRetryFired()
+            self.lock.unlock()
+        }
+        escalatedRetryWorkItem = workItem
+        DispatchQueue.global().asyncAfter(
+            deadline: .now() + WatchdogThresholds.escalatedRetrySeconds, execute: workItem
+        )
     }
 
     /// Section 8.1 "The escalated retry decision" — exactly one of three

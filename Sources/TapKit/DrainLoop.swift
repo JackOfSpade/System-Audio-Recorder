@@ -26,6 +26,8 @@ public final class MeterSnapshotBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: MeterSnapshot = .empty
 
+    public init() {}
+
     public func publish(_ snapshot: MeterSnapshot) {
         lock.lock(); value = snapshot; lock.unlock()
     }
@@ -44,13 +46,22 @@ public protocol DrainLoopDelegate: AnyObject {
     func drainLoop(_ loop: DrainLoop, zeroRunSeconds: Double)
     /// Called when the dropped-chunk/dropped-frame counters advance.
     func drainLoop(_ loop: DrainLoop, overrunDroppedChunks: UInt64, droppedFrames: UInt64)
+    /// Called at most once, after `consecutiveWriteFailureLimit` back-to-back
+    /// segment-write failures (disk full, I/O error): from here on the
+    /// recording is silently losing every drained sample, so the session
+    /// must be finalized and the failure surfaced — logging alone would let
+    /// hours of "recording" produce a truncated file with a success signal.
+    func drainLoop(_ loop: DrainLoop, didFailWriting error: String)
 }
 
 /// One dedicated `Thread` per lane (QoS `.userInitiated`), polling the ring on
 /// a 50 ms cycle (Section 4.2 / Section 5.4). Owns the lane's `SegmentWriter`
 /// and publishes the meter snapshot the UI polls at 20 Hz.
 public final class DrainLoop {
-    public let meterBox = MeterSnapshotBox()
+    /// Owned by the lane, not this loop, so meters survive rebuilds and can
+    /// be read from any thread without touching the lane's `drainLoop`
+    /// property (which the engine queue reassigns during rebuilds).
+    public let meterBox: MeterSnapshotBox
     public weak var delegate: DrainLoopDelegate?
 
     private let ring: OpaquePointer
@@ -74,6 +85,10 @@ public final class DrainLoop {
     private let stopFlag = AtomicBool()
     private var zeroRunFrames: Int64 = 0
     private var framePosition: Int64 = 0
+    /// ~1 s of failed 50 ms cycles before declaring the write path dead.
+    static let consecutiveWriteFailureLimit = 20
+    private var consecutiveWriteFailures = 0
+    private var reportedWriteFailure = false
 
     private var scratch: [UInt8]
     private var interleaveScratch: [UInt8]
@@ -86,8 +101,10 @@ public final class DrainLoop {
         sampleRate: Float64,
         planar: Bool,
         segmentWriter: SegmentWriter,
-        framesPerCallback: UInt32
+        framesPerCallback: UInt32,
+        meterBox: MeterSnapshotBox = MeterSnapshotBox()
     ) {
+        self.meterBox = meterBox
         self.ring = ring
         self.context = context
         self.bytesPerFrame = bytesPerFrame
@@ -115,11 +132,13 @@ public final class DrainLoop {
     /// enters STOPPING". Blocks until the drain thread has emptied the ring.
     public func stopAndDrainFully() {
         stopFlag.set(true)
-        // The loop itself performs the final drain pass before exiting; give
-        // it a moment. Callers on the engine queue should treat this as
-        // fire-and-forget-with-join semantics via a completion callback in a
-        // fuller implementation; here we busy-wait briefly as a simple join.
-        while thread?.isExecuting == true {
+        // Join on `isFinished`, not `isExecuting`: a thread that has been
+        // start()ed but not yet scheduled reports isExecuting == false, so an
+        // isExecuting-based join could return while the thread is still about
+        // to run — and the caller would then destroy the ring under it
+        // (use-after-free). isFinished is false for that not-yet-scheduled
+        // thread and only flips true after runLoop() returns.
+        while let t = thread, !t.isFinished {
             Thread.sleep(forTimeInterval: 0.005)
         }
     }
@@ -222,15 +241,21 @@ public final class DrainLoop {
         do {
             if planar {
                 try interleaveScratch.withUnsafeBytes { interleaved in
-                    try segmentWriter.write(bytes: interleaved.baseAddress!, byteCount: bytesRead, frameCount: UInt32(frameCount), channels: UInt32(channels))
+                    try segmentWriter.write(bytes: interleaved.baseAddress!, byteCount: bytesRead, frameCount: UInt32(frameCount))
                 }
             } else {
                 try scratch.withUnsafeBytes { raw in
-                    try segmentWriter.write(bytes: raw.baseAddress!, byteCount: bytesRead, frameCount: UInt32(frameCount), channels: UInt32(channels))
+                    try segmentWriter.write(bytes: raw.baseAddress!, byteCount: bytesRead, frameCount: UInt32(frameCount))
                 }
             }
+            consecutiveWriteFailures = 0
         } catch {
             Log.error("segment write failed: \(error)")
+            consecutiveWriteFailures += 1
+            if consecutiveWriteFailures >= Self.consecutiveWriteFailureLimit && !reportedWriteFailure {
+                reportedWriteFailure = true
+                delegate?.drainLoop(self, didFailWriting: "\(error)")
+            }
         }
         framePosition += Int64(frameCount)
 

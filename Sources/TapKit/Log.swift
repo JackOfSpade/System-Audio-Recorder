@@ -37,12 +37,16 @@ public enum Log {
     }
 
     private static func write(level: String, message: String, file: String, line: Int) {
-        let entry = "\(ManifestTimestamp.now()) [\(level)] \(file):\(line) \(message)\n"
+        let entry = "\(Timestamp.now()) [\(level)] \(file):\(line) \(message)\n"
         guard let data = entry.data(using: .utf8) else { return }
         queue.sync {
             guard let fileHandle else { return } // start() was never called
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(data)
+            // Error-returning APIs, not the legacy exception-raising ones:
+            // an ObjC exception from a disk-full write(2) is uncatchable
+            // from Swift and would abort the process — the logging layer
+            // must never be able to kill a recording. Degrade to stderr.
+            _ = try? fileHandle.seekToEnd()
+            try? fileHandle.write(contentsOf: data)
         }
         FileHandle.standardError.write(data)
     }

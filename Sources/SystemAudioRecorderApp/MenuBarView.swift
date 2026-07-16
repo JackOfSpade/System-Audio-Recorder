@@ -43,9 +43,17 @@ struct MenuBarView: View {
                 Text("System audio capture permission not granted.")
                     .font(.caption)
                     .foregroundStyle(.red)
-                Button("Open System Settings") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
-                        NSWorkspace.shared.open(url)
+                HStack {
+                    Button("Open System Settings") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    // Re-probes TCC (silent once the system has an answer) so
+                    // granting access in System Settings can actually
+                    // re-enable the Record button without relaunching.
+                    Button("Check Again") {
+                        appState.requestPermissionIfNeeded()
                     }
                 }
             }

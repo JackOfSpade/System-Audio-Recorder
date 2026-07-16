@@ -1,20 +1,12 @@
 import Darwin
 import Foundation
 
-public struct SessionSummary: Sendable {
-    public let folderURL: URL
-    public let manifest: SessionManifest
-}
-
-/// Creates session folders under the recordings root, reads/writes
-/// `session.json`, maintains the library index, and runs the crash-recovery
-/// scan at launch (Section 6.3–6.5).
+/// Owns the recordings folder: naming-template expansion, filename
+/// sanitization, collision-free destination URLs, and the launch-time sweep
+/// that rescues partial captures left behind by a crash (Section 6.5's
+/// recovery intent, applied to the streaming master files).
 public final class SessionStore {
     public let recordingsRoot: URL
-    /// Section 6.4 "Write policy": all manifest file I/O is serialized on
-    /// this dedicated serial queue — the engine queue only ever hands event
-    /// records to `SessionStore`'s API, never touches the file itself.
-    private let ioQueue = DispatchQueue(label: "com.systemaudiorecorder.sessionstore.io")
 
     public init(recordingsRoot: URL) {
         self.recordingsRoot = recordingsRoot
@@ -100,197 +92,115 @@ public final class SessionStore {
         return truncated
     }
 
-    /// Creates the session folder, handling name collisions with " (2)", " (3)", ...
-    public func createSessionFolder(title: String) throws -> URL {
-        let sanitized = Self.sanitize(title)
-        var candidate = recordingsRoot.appendingPathComponent(sanitized)
+    /// "base.ext", or "base (2).ext", "base (3).ext", ... — the first name
+    /// that doesn't already exist in `directory`.
+    public static func uniqueDestinationURL(base: String, ext: String, in directory: URL) -> URL {
+        var candidate = directory.appendingPathComponent("\(base).\(ext)")
         var suffix = 2
         while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = recordingsRoot.appendingPathComponent("\(sanitized) (\(suffix))")
+            candidate = directory.appendingPathComponent("\(base) (\(suffix)).\(ext)")
             suffix += 1
         }
-        try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
         return candidate
     }
 
-    // MARK: Advisory lock file (Section 6.3 / 6.5)
+    // MARK: Crash sweep (Section 6.5's recovery intent)
 
-    public func createLockFile(in folder: URL) {
-        let lockURL = folder.appendingPathComponent(".recording.lock")
-        let pid = ProcessInfo.processInfo.processIdentifier
-        // Record our own executable path alongside the PID (Section 6.5): a
-        // bare PID is not enough to prove liveness — after a crash + reboot
-        // (or just enough process churn) the OS can hand that same PID to a
-        // completely unrelated process, which would make `isLive` treat this
-        // session as permanently in-progress and never recover it.
-        let exePath = Self.currentExecutablePath() ?? ""
-        try? "\(pid)\n\(exePath)".data(using: .utf8)?.write(to: lockURL, options: .atomic)
-    }
-
-    private static func currentExecutablePath() -> String? {
-        executablePath(for: ProcessInfo.processInfo.processIdentifier)
-    }
-
-    private static func executablePath(for pid: pid_t) -> String? {
-        var buffer = [Int8](repeating: 0, count: 4096) // 4 * MAXPATHLEN
-        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-        guard length > 0 else { return nil }
-        return String(cString: buffer)
-    }
-
-    public func removeLockFile(in folder: URL) {
-        let lockURL = folder.appendingPathComponent(".recording.lock")
-        try? FileManager.default.removeItem(at: lockURL)
-    }
-
-    // MARK: Manifest I/O (Section 6.4 write policy — atomic tmp+rename)
-
-    public func writeManifest(_ manifest: SessionManifest, to folder: URL, completion: (() -> Void)? = nil) {
-        ioQueue.async {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let finalURL = folder.appendingPathComponent("session.json")
-            let tmpURL = folder.appendingPathComponent("session.json.tmp")
-            do {
-                let data = try encoder.encode(manifest)
-                try data.write(to: tmpURL, options: .atomic)
-                _ = try FileManager.default.replaceItemAt(finalURL, withItemAt: tmpURL)
-            } catch {
-                // Previously encode failures were swallowed by `try?` with no
-                // logging at all, unlike the write/rename failure below —
-                // silently dropping the entire manifest update on the floor.
-                Log.error("manifest write failed: \(error)")
-            }
-            completion?()
-        }
-    }
-
-    public func readManifest(from folder: URL) throws -> SessionManifest {
-        let url = folder.appendingPathComponent("session.json")
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(SessionManifest.self, from: data)
-    }
-
-    // MARK: Library index
-
-    public func listSessions() -> [SessionSummary] {
-        guard let subfolders = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil) else {
-            return []
-        }
-        var summaries: [SessionSummary] = []
-        for folder in subfolders {
-            guard (try? folder.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
-            guard let manifest = try? readManifest(from: folder) else { continue }
-            summaries.append(SessionSummary(folderURL: folder, manifest: manifest))
-        }
-        return summaries.sorted { $0.manifest.session.createdAt > $1.manifest.session.createdAt }
-    }
-
-    // MARK: Crash-recovery scan (Section 6.5)
-
-    /// Runs at every launch (GUI and CLI). Section 6.5 liveness guards: skip
-    /// any session whose `.recording.lock` names a live PID, or whose
-    /// session.json / most-recent segment was modified within the last 30s.
-    public func runCrashRecoveryScan() {
-        guard let subfolders = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil) else {
-            return
-        }
-        for folder in subfolders {
-            guard (try? folder.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
-            recoverSessionIfNeeded(at: folder)
-        }
-    }
-
-    private func recoverSessionIfNeeded(at folder: URL) {
-        if isLive(folder) { return }
-
-        guard var manifest = try? readManifest(from: folder) else {
-            return // no session.json: reconstruction from bare .caf files is a
-                    // documented Section 6.5 case, not implemented in this pass.
-        }
-        guard manifest.session.finalizedAt == nil else { return } // already finalized
-
-        var allSegmentsRecovered = true
-        for laneIndex in manifest.lanes.indices {
-            for segmentIndex in manifest.lanes[laneIndex].segments.indices {
-                var segment = manifest.lanes[laneIndex].segments[segmentIndex]
-                guard !segment.finalized else { continue }
-                let segmentURL = folder.appendingPathComponent(segment.file)
-                if let frames = CAFRecovery.patchUnfinalizedSegment(at: segmentURL, channels: segment.channels) {
-                    segment.frames = frames
-                    segment.finalized = true
-                    manifest.lanes[laneIndex].segments[segmentIndex] = segment
-                } else {
-                    allSegmentsRecovered = false
-                }
-            }
-        }
-
-        // Only claim the whole session finalized/recovered if EVERY segment
-        // actually patched — `finalizedAt == nil` above is the only gate
-        // that lets a future scan ever reconsider this folder, so falsely
-        // setting it here would permanently freeze a still-broken segment
-        // in its half-recovered (finalized:false) state. Segments that DID
-        // patch successfully are still saved either way, so a future scan
-        // only ever has to retry the ones that actually failed.
-        if allSegmentsRecovered {
-            manifest.session.recovered = true
-            manifest.session.finalizedAt = ManifestTimestamp.now()
-        }
-        // The lock file must not be removed until the manifest write it
-        // depends on has actually landed on disk — removing it synchronously
-        // right after a fire-and-forget write let a process exit (or a
-        // second recovery pass) observe a missing lock but a stale manifest.
-        writeManifest(manifest, to: folder) { [weak self] in
-            if allSegmentsRecovered {
-                self?.removeLockFile(in: folder)
-            }
-        }
-    }
-
-    private func isLive(_ folder: URL) -> Bool {
-        let lockURL = folder.appendingPathComponent(".recording.lock")
-        if let contents = try? String(contentsOf: lockURL, encoding: .utf8) {
-            let lines = contents.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-            if let pidLine = lines.first,
-               let pid = pid_t(pidLine.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                if kill(pid, 0) == 0 || errno == EPERM {
-                    // The PID exists, but PIDs get reused — confirm the live
-                    // process is actually the one that created this lock
-                    // (same executable path) before trusting it, so a
-                    // crashed session isn't held "live" forever by some
-                    // unrelated process the OS later assigned the same PID.
-                    let recordedPath = lines.count > 1 ? String(lines[1]) : ""
-                    if !recordedPath.isEmpty, let livePath = Self.executablePath(for: pid) {
-                        return livePath == recordedPath
-                    }
-                    // No recorded path (older lock format) or we couldn't
-                    // read the live process's path (e.g. EPERM) — be
-                    // conservative and treat it as live rather than risk
-                    // clobbering an in-progress recording.
-                    return true
-                }
-            }
-        }
-
-        // Recency check (Section 6.5): skip if session.json or the newest
-        // segment was modified within the last 30 seconds.
-        let recencyWindow: TimeInterval = 30
+    /// Rescues `.capture_*.caf` master files left behind by a crash: patches
+    /// the unfinalized CAF header via `CAFRecovery` and promotes the file to
+    /// a visible "Recovered <timestamp>" name. Runs at every launch (GUI and
+    /// CLI `record`).
+    ///
+    /// Liveness is decided by the owning session's flock'd `.live` lock file
+    /// (see `SegmentWriter.sessionLockURL`): a session that is still running
+    /// in another process holds the lock, so its segments — including
+    /// finalized ones whose mtime froze hours ago after a mid-session
+    /// rotation, and segments parked in waiting-for-device — are never
+    /// stolen. The 60 s mtime guard remains as a fallback for files with no
+    /// parseable token/lock (and for the actively-written segment, whose
+    /// mtime advances every ~50 ms drain flush).
+    public func sweepPartialCaptures() {
         let fm = FileManager.default
-        var newestModified: Date = .distantPast
-        if let attrs = try? fm.attributesOfItem(atPath: folder.appendingPathComponent("session.json").path),
-           let modified = attrs[.modificationDate] as? Date {
-            newestModified = max(newestModified, modified)
-        }
-        if let contents = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey]) {
-            for url in contents where url.pathExtension == "caf" {
-                if let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
-                   let modified = values.contentModificationDate {
-                    newestModified = max(newestModified, modified)
-                }
+        guard let contents = try? fm.contentsOfDirectory(
+            at: recordingsRoot, includingPropertiesForKeys: [.contentModificationDateKey],
+            options: []
+        ) else { return }
+
+        for url in contents {
+            guard url.lastPathComponent.hasPrefix(SegmentWriter.partialFilePrefix),
+                  url.pathExtension == "caf" else { continue }
+            if let token = Self.sessionToken(fromPartialFileName: url.lastPathComponent),
+               Self.sessionIsLive(token: token, in: recordingsRoot) {
+                continue // finalized or open segment of a live session — never touch
+            }
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            guard Date().timeIntervalSince(modified) > 60 else { continue }
+
+            guard let frames = CAFRecovery.patchUnfinalizedSegment(at: url) else {
+                Log.error("sweep: could not recover partial capture \(url.lastPathComponent); leaving it in place")
+                continue
+            }
+            guard frames > 0 else {
+                // Structurally valid but empty — nothing to rescue.
+                try? fm.removeItem(at: url)
+                Log.info("sweep: removed empty partial capture \(url.lastPathComponent)")
+                continue
+            }
+
+            let fixedLocale = Locale(identifier: "en_US_POSIX")
+            let formatter = DateFormatter()
+            formatter.locale = fixedLocale
+            formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+            let base = "Recovered \(formatter.string(from: modified))"
+            let destination = Self.uniqueDestinationURL(base: base, ext: "caf", in: recordingsRoot)
+            do {
+                try fm.moveItem(at: url, to: destination)
+                Log.info("sweep: recovered crashed recording (\(frames) frames) as \(destination.lastPathComponent)")
+            } catch {
+                Log.error("sweep: recovered \(url.lastPathComponent) but could not rename it: \(error)")
             }
         }
-        return Date().timeIntervalSince(newestModified) < recencyWindow
+
+        // Remove `.live` lock files whose owning process is gone (crash
+        // leftovers — a graceful session unlinks its own).
+        for url in contents where url.pathExtension == "live" && url.lastPathComponent.hasPrefix(SegmentWriter.partialFilePrefix) {
+            let fd = open(url.path, O_RDWR)
+            guard fd >= 0 else { continue }
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                flock(fd, LOCK_UN)
+                try? fm.removeItem(at: url)
+            }
+            close(fd)
+        }
+    }
+
+    /// Parses the session token out of a partial-segment filename:
+    /// ".capture_<token>-<n>.caf" → token (the token itself contains
+    /// hyphens — a UUID — so the index is split off at the LAST hyphen,
+    /// which must be all digits).
+    static func sessionToken(fromPartialFileName name: String) -> String? {
+        guard name.hasPrefix(SegmentWriter.partialFilePrefix), name.hasSuffix(".caf") else { return nil }
+        let stem = name.dropFirst(SegmentWriter.partialFilePrefix.count).dropLast(4)
+        guard let lastDash = stem.lastIndex(of: "-") else { return nil }
+        let indexPart = stem[stem.index(after: lastDash)...]
+        guard !indexPart.isEmpty, indexPart.allSatisfy({ $0.isNumber }) else { return nil }
+        return String(stem[..<lastDash])
+    }
+
+    /// True if the session that owns `token` is still alive in some process
+    /// — i.e. its `.live` lock file exists and is still exclusively flock'd.
+    /// flock releases automatically when the owner dies, so a crashed
+    /// session's lock probe succeeds and the sweep may proceed.
+    static func sessionIsLive(token: String, in directory: URL) -> Bool {
+        let lockURL = SegmentWriter.sessionLockURL(directory: directory, token: token)
+        let fd = open(lockURL.path, O_RDWR)
+        guard fd >= 0 else { return false } // no lock file — not live
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return false // lock acquirable — owner is dead
+        }
+        return true
     }
 }
 
@@ -301,17 +211,10 @@ public final class SessionStore {
 public enum CAFRecovery {
     /// Locates the unfinalized `data` chunk, truncates to the last whole
     /// frame if the crash landed mid-frame, and patches the chunk's size
-    /// field. Returns the patched frame count, or nil if the file could not
-    /// be parsed as an unfinalized CAF (already finalized, corrupt, etc.).
-    public static func patchUnfinalizedSegment(at url: URL, channels: Int) -> Int? {
-        // A corrupted/hand-edited manifest could carry `channels: 0` on an
-        // unfinalized segment; `% Int64(bytesPerFrame)` below would then
-        // divide by zero and trap (Swift's remainder operator does not
-        // return NaN/inf like floating point — it's a fatal error), turning
-        // one bad segment into a permanent crash-on-launch for every future
-        // run of `runCrashRecoveryScan()`.
-        guard channels > 0 else { return nil }
-        let bytesPerFrame = channels * 4 // Float32 (Section 6.1)
+    /// field. The channel count comes from the file's own `desc` chunk
+    /// unless the caller supplies one. Returns the patched frame count, or
+    /// nil if the file could not be parsed as a CAF this app produced.
+    public static func patchUnfinalizedSegment(at url: URL, channels: Int? = nil) -> Int? {
         guard let handle = try? FileHandle(forUpdating: url) else { return nil }
         defer { try? handle.close() }
 
@@ -329,6 +232,7 @@ public enum CAFRecovery {
         }
         guard version == 1 else { return nil }
 
+        var descChannels: Int?
         var offset: UInt64 = 8
         while offset + 12 <= fileLength {
             try? handle.seek(toOffset: offset)
@@ -344,7 +248,28 @@ public enum CAFRecovery {
                 raw.loadUnaligned(fromByteOffset: 4, as: Int64.self).bigEndian
             }
 
+            if type == "desc" {
+                // CAFAudioDescription (all big-endian): sampleRate f64,
+                // formatID u32, formatFlags u32, bytesPerPacket u32,
+                // framesPerPacket u32, channelsPerFrame u32, bitsPerChannel
+                // u32 — channelsPerFrame sits 24 bytes into the payload.
+                if chunkSize >= 32,
+                   let payload = try? handle.read(upToCount: 32), payload.count == 32 {
+                    let ch = [UInt8](payload).withUnsafeBytes { raw -> UInt32 in
+                        raw.loadUnaligned(fromByteOffset: 24, as: UInt32.self).bigEndian
+                    }
+                    if ch > 0 { descChannels = Int(ch) }
+                }
+            }
+
             if type == "data" {
+                // A corrupted/hand-edited file could carry channels == 0;
+                // `% Int64(bytesPerFrame)` below would then divide by zero
+                // and trap (Swift's remainder operator is a fatal error on
+                // zero, not NaN/inf like floating point).
+                guard let ch = channels ?? descChannels, ch > 0 else { return nil }
+                let bytesPerFrame = ch * 4 // Float32 (Section 6.1)
+
                 let dataPayloadOffset = offset + 12
                 // First 4 bytes of the data chunk payload are mEditCount.
                 let audioStart = dataPayloadOffset + 4

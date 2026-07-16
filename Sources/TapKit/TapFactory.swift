@@ -12,8 +12,6 @@ public struct TapHandle {
     /// Ground truth for the bytes the IOProc will deliver (Section 5/7).
     public let effectiveFormat: AudioStreamBasicDescription
     public let targetDeviceID: AudioObjectID
-    public let targetDeviceUID: String
-    public let outputChannelCount: Int
 }
 
 /// Creates and destroys the `CATapDescription`, the process tap, and the
@@ -37,7 +35,6 @@ public enum TapFactory {
         let deviceID = try resolvedDeviceID ?? AudioDeviceDirectory.resolveDevice(for: spec.device)
         let deviceUID = try AudioDeviceDirectory.deviceUID(deviceID)
         let nominalRate = try AudioDeviceDirectory.nominalSampleRate(deviceID)
-        let channelCount = (try? AudioDeviceDirectory.outputChannelCount(deviceID)) ?? 2
 
         // Step 2: build the CATapDescription — always a global system-mix
         // tap excluding `excludeProcessIDs` (Section 4.5 step 2).
@@ -99,9 +96,7 @@ public enum TapFactory {
             tapUID: tapUID,
             aggregateID: aggregateID,
             effectiveFormat: tapFormat,
-            targetDeviceID: deviceID,
-            targetDeviceUID: deviceUID,
-            outputChannelCount: channelCount
+            targetDeviceID: deviceID
         )
     }
 

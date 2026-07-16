@@ -89,6 +89,13 @@ void td_context_destroy(td_context_t *ctx);
  * (re)build so the next IOProc callback re-latches firstHostTime. */
 void td_context_arm_first_host_time(td_context_t *ctx);
 
+/* Engine-queue only, before the IOProc is registered. When nonzero, planar
+ * chunks whose frame count differs from this value are dropped whole (with
+ * the drop counters incremented) instead of being written — the consumer
+ * parses planar ring content as fixed frames_per_callback blocks, and one
+ * odd-sized chunk would desync every later plane boundary (Section 5.3). */
+void td_context_set_expected_frames(td_context_t *ctx, uint32_t frames_per_callback);
+
 /* IOProc thread ONLY. Interleaved case: data/byte_count describe one
  * contiguous buffer of raw sample bytes (byte_count a whole multiple of
  * bytes_per_frame). Copies into the ring (drop-all-or-nothing on overflow)

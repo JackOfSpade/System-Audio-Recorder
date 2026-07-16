@@ -1,37 +1,126 @@
 import AudioToolbox
 import CoreAudio
+import Darwin
 import Foundation
 
-/// Owns all master-file I/O for one `CaptureLane` (Section 6.2). Runs
-/// exclusively on that lane's `DrainLoop` thread — never on the real-time
-/// IOProc thread. The one iron rule: client and file ASBDs are byte-identical,
-/// so `ExtAudioFile` never engages an `AudioConverter` — there is no code path
+/// Owns all master-file I/O for one `CaptureLane` (Section 6.2). Audio is
+/// streamed to disk as it is drained — CAF segment files in the recordings
+/// folder, hidden behind a `.capture_` prefix until `CaptureEngine.stop()`
+/// promotes them to their final names — so a crash never loses more than the
+/// last unflushed buffer, recordings are never bounded by RAM, and a
+/// mid-session sample-rate change simply rotates to a new segment file with
+/// its own correct ASBD instead of corrupting a single-rate master.
+///
+/// The one iron rule: client and file ASBDs are byte-identical, so
+/// `ExtAudioFile` never engages an `AudioConverter` — there is no code path
 /// on which SRC, dither, bit-depth change, or the float→Int32 WAV truncation
 /// bug can occur.
+///
+/// Thread contract: `write` runs on the lane's `DrainLoop` thread;
+/// `openNextSegment`/`finalizeCurrentSegment` run on the engine queue. An
+/// internal lock serializes them — the lane's teardown ordering (drain thread
+/// stopped before finalize) means the lock is contended only in pathological
+/// interleavings, but a torn `current` read must be impossible either way.
 public final class SegmentWriter {
-    public struct OpenSegment {
+    /// A fully-written, closed segment file awaiting export/promotion.
+    public struct FinishedSegment: Sendable {
         public let url: URL
-        public let index: Int
         public let asbd: AudioStreamBasicDescription
-        public var framesWritten: Int64 = 0
+        public let frames: Int64
     }
 
-    private(set) public var current: OpenSegment?
-    public private(set) var data = Data()
-    /// The ASBD of the most recently opened segment. Kept separate from
-    /// `current` (cleared by `finalizeCurrentSegment()`) because callers —
-    /// `CaptureEngine.stop()` in particular — need the format AFTER the
-    /// session has already been finalized, to write out `data` as the final
-    /// file. Never cleared: `asbd` must still answer correctly post-stop.
+    private struct OpenSegment {
+        let url: URL
+        let asbd: AudioStreamBasicDescription
+        let file: ExtAudioFileRef
+        var framesWritten: Int64 = 0
+    }
+
+    private let directory: URL
+    /// One token per writer (= per session): segment files are
+    /// ".capture_<token>-<index>.caf" so concurrent sessions in the GUI and
+    /// CLI can never collide, and the crash sweep can find strays by prefix.
+    private let sessionToken = UUID().uuidString
+    private var segmentIndex = 0
+
+    private let lock = NSLock()
+    private var current: OpenSegment?
+    private var _finished: [FinishedSegment] = []
     private var lastOpenedASBD: AudioStreamBasicDescription?
+
+    /// Prefix shared with `SessionStore.sweepPartialCaptures()`.
+    public static let partialFilePrefix = ".capture_"
+
+    /// The session-liveness lock file for a given session token — held
+    /// exclusively (flock) by the owning SegmentWriter for its lifetime, so
+    /// another process' launch sweep can distinguish "finalized segment of a
+    /// LIVE session" (rotated part 1, or parked in waiting-for-device, both
+    /// of which sit with frozen mtimes for hours) from a genuine crash
+    /// leftover. flock releases automatically if the owner crashes.
+    public static func sessionLockURL(directory: URL, token: String) -> URL {
+        directory.appendingPathComponent("\(partialFilePrefix)\(token).live")
+    }
+
+    private var sessionLockFD: Int32 = -1
+    private var sessionLockURLIfHeld: URL?
+
+    public init(directory: URL) {
+        self.directory = directory
+        let lockURL = Self.sessionLockURL(directory: directory, token: sessionToken)
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        if fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            sessionLockFD = fd
+            sessionLockURLIfHeld = lockURL
+        } else {
+            // Degrade to mtime-only sweep protection rather than failing the
+            // session — the token is a fresh UUID, so contention here means
+            // something exotic (e.g. an unwritable folder caught later by
+            // openNextSegment).
+            if fd >= 0 { close(fd) }
+        }
+    }
+
+    deinit {
+        // Graceful owners call releaseSessionLock() after consuming the
+        // segments; this is only the safety net (fd would close with the
+        // process anyway — a crash is exactly when the sweep SHOULD see the
+        // lock released and rescue the files).
+        if sessionLockFD >= 0 { close(sessionLockFD) }
+    }
+
+    /// Releases the session-liveness lock and removes its lock file. Called
+    /// once the session's segment files have been consumed (exported,
+    /// attempted, or deleted) — from that point any leftover `.capture_`
+    /// file of this session is genuinely orphaned and the sweep may take it.
+    public func releaseSessionLock() {
+        lock.lock(); defer { lock.unlock() }
+        guard sessionLockFD >= 0 else { return }
+        flock(sessionLockFD, LOCK_UN)
+        close(sessionLockFD)
+        sessionLockFD = -1
+        if let url = sessionLockURLIfHeld {
+            try? FileManager.default.removeItem(at: url)
+        }
+        sessionLockURLIfHeld = nil
+    }
+
+    /// Segments finalized so far, in capture order. Engine queue only
+    /// (after the lane has stopped, this is the complete session).
+    public var finishedSegments: [FinishedSegment] {
+        lock.lock(); defer { lock.unlock() }
+        return _finished
+    }
 
     /// The ASBD of the currently open segment, or — once finalized — the
     /// last segment that was open. Nil only if no segment was ever opened.
     public var asbd: AudioStreamBasicDescription? {
-        current?.asbd ?? lastOpenedASBD
+        lock.lock(); defer { lock.unlock() }
+        return current?.asbd ?? lastOpenedASBD
     }
 
-    public init() {
+    public var hasOpenSegment: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return current != nil
     }
 
     /// Builds the canonical ASBD (Section 6.2 table): Float32, interleaved,
@@ -51,52 +140,110 @@ public final class SegmentWriter {
         )
     }
 
-    /// Prepares the in-memory buffer. Does NOT reset `data` — a fresh
-    /// `SegmentWriter` already starts with an empty buffer, and a later call
-    /// (a device-switch/rate-change rebuild opening its next segment) must
-    /// keep appending to the same master buffer, not discard everything
-    /// captured before the rotation.
+    /// Creates the next on-disk CAF segment. Any previously open segment must
+    /// have been finalized first (the lane's rotation paths guarantee this).
     @discardableResult
-    public func openNextSegment(asbd: AudioStreamBasicDescription) throws -> OpenSegment {
-        let url = URL(fileURLWithPath: "/dummy/segment.caf")
-        let segment = OpenSegment(url: url, index: 1, asbd: asbd, framesWritten: 0)
-        current = segment
+    public func openNextSegment(asbd: AudioStreamBasicDescription) throws -> URL {
+        lock.lock(); defer { lock.unlock() }
+        if let stale = current {
+            // Defensive: never leak an open ExtAudioFile. Finalize in place.
+            Log.error("openNextSegment called with a segment already open (\(stale.url.lastPathComponent)); finalizing it first")
+            finalizeLocked()
+        }
+        segmentIndex += 1
+        let url = directory.appendingPathComponent("\(Self.partialFilePrefix)\(sessionToken)-\(segmentIndex).caf")
+
+        var fileASBD = asbd
+        var audioFile: ExtAudioFileRef?
+        let createStatus = ExtAudioFileCreateWithURL(
+            url as CFURL, kAudioFileCAFType, &fileASBD, nil, AudioFileFlags.eraseFile.rawValue, &audioFile
+        )
+        guard createStatus == noErr, let file = audioFile else {
+            throw CoreAudioError(status: createStatus, context: "ExtAudioFileCreateWithURL(segment)")
+        }
+        var clientASBD = asbd
+        let setStatus = ExtAudioFileSetProperty(
+            file, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &clientASBD
+        )
+        guard setStatus == noErr else {
+            ExtAudioFileDispose(file)
+            try? FileManager.default.removeItem(at: url)
+            throw CoreAudioError(status: setStatus, context: "ExtAudioFileSetProperty(ClientDataFormat)")
+        }
+
+        current = OpenSegment(url: url, asbd: asbd, file: file)
         lastOpenedASBD = asbd
-        return segment
+        return url
     }
 
-    /// Synchronous write of `frameCount` interleaved frames starting at `bytes`
-    /// into the in-memory buffer.
-    public func write(bytes: UnsafeRawPointer, byteCount: Int, frameCount: UInt32, channels: UInt32) throws {
+    /// Synchronous write of `frameCount` interleaved frames starting at
+    /// `bytes` into the open segment file. DrainLoop thread.
+    public func write(bytes: UnsafeRawPointer, byteCount: Int, frameCount: UInt32) throws {
+        lock.lock(); defer { lock.unlock() }
         guard var segment = current else { throw SegmentWriterError.noOpenSegment }
-        data.append(UnsafeBufferPointer(start: bytes.assumingMemoryBound(to: UInt8.self), count: byteCount))
+        var bufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(
+                mNumberChannels: segment.asbd.mChannelsPerFrame,
+                mDataByteSize: UInt32(byteCount),
+                mData: UnsafeMutableRawPointer(mutating: bytes)
+            )
+        )
+        let status = ExtAudioFileWrite(segment.file, frameCount, &bufferList)
+        guard status == noErr else {
+            throw CoreAudioError(status: status, context: "ExtAudioFileWrite(segment)")
+        }
         segment.framesWritten += Int64(frameCount)
         current = segment
     }
 
     /// Result of `finalizeCurrentSegment()`: the frame count written, and
-    /// whether finalization succeeded.
+    /// whether a segment was actually open to finalize.
     public struct FinalizeResult {
         public let frames: Int64
         public let succeeded: Bool
     }
 
-    /// Finalization: returns the final frame count.
+    /// Closes the open segment file (finalizing its CAF header) and records
+    /// it in `finishedSegments`. Safe no-op when nothing is open — stop after
+    /// a rotation, waiting-for-device, or a failed start all legitimately
+    /// arrive here with no open segment.
     @discardableResult
     public func finalizeCurrentSegment() -> FinalizeResult {
-        guard let segment = current else {
-            Log.error("finalizeCurrentSegment called with no open segment")
+        lock.lock(); defer { lock.unlock() }
+        guard current != nil else {
             return FinalizeResult(frames: 0, succeeded: false)
         }
-        let frames = segment.framesWritten
-        current = nil
+        let frames = finalizeLocked()
         return FinalizeResult(frames: frames, succeeded: true)
     }
 
-    /// Section 6.2's mandatory bit-exact write/read-back self-check. Runs at
-    /// every launch (app and CLI), in all builds. Returns true if the file
-    /// layer round-trips bit-exactly; false is a fatal configuration
-    /// regression the caller must refuse to record on.
+    /// Removes every finished segment file from disk. Used when a session
+    /// start fails (nothing worth keeping) or captured no audio at all.
+    public func removeAllSegmentFiles() {
+        lock.lock()
+        if current != nil { finalizeLocked() }
+        for segment in _finished {
+            try? FileManager.default.removeItem(at: segment.url)
+        }
+        _finished.removeAll()
+        lock.unlock()
+        releaseSessionLock()
+    }
+
+    @discardableResult
+    private func finalizeLocked() -> Int64 {
+        guard let segment = current else { return 0 }
+        ExtAudioFileDispose(segment.file)
+        _finished.append(FinishedSegment(url: segment.url, asbd: segment.asbd, frames: segment.framesWritten))
+        current = nil
+        return segment.framesWritten
+    }
+
+    /// Section 6.2's mandatory bit-exact write/read-back self-check. Called
+    /// at launch by both entry points: the CLI's `record` verb refuses to
+    /// record on failure; the GUI warns with a critical alert. Also covered
+    /// by `SegmentWriterTests`.
     public static func runBitExactSelfCheck(scratchDirectory: URL) -> Bool {
         let sampleRate: Float64 = 48000
         let channels: UInt32 = 2

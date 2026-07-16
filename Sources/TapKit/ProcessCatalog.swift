@@ -86,9 +86,12 @@ public final class ProcessCatalog {
 
     /// "Is any relevant process currently outputting audio?" (Section 8.1
     /// corroboration signal). `excludingPIDs` covers System Audio Recorder's own PID and
-    /// any system-mix exclusion list.
-    public static func isAnyRelevantProcessOutputting(excludingPIDs: Set<pid_t>) -> Bool {
-        guard let processes = try? allProcesses() else { return false }
+    /// any system-mix exclusion list. Returns nil when the HAL enumeration
+    /// itself fails — the caller must report that as an ERRORED poll, not as
+    /// "no one is playing": conflating the two holds the watchdog's dropout
+    /// confirmation in SUSPICIOUS forever while the enumeration is broken.
+    public static func isAnyRelevantProcessOutputting(excludingPIDs: Set<pid_t>) -> Bool? {
+        guard let processes = try? allProcesses() else { return nil }
         for process in processes {
             if excludingPIDs.contains(process.pid) { continue }
             if process.isRunningOutput { return true }

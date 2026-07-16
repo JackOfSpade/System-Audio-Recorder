@@ -176,6 +176,13 @@ void td_ring_take_dropped_deltas(td_ring_t *ring, uint64_t *out_dropped_chunks, 
 struct td_context_s {
     td_ring_t *ring;           /* not owned */
     uint32_t   bytes_per_frame;
+    /* Section 5.3 planar framing contract: when nonzero, every planar chunk
+     * must be exactly this many frames or it is dropped whole — the drain
+     * side parses the ring as fixed-size plane-major blocks and a single
+     * odd-sized chunk would permanently desync every later plane boundary.
+     * Set once on the engine queue before the IOProc starts; read-only on
+     * the IOProc thread afterward. */
+    uint32_t   expected_frames_per_callback;
 
     /* IOProc-thread-owned scratch for the planar concatenation path, sized
      * generously at create time; TD_MAX_PLANES bounds the loop. Written only
@@ -220,6 +227,11 @@ void td_context_destroy(td_context_t *ctx) {
     free(ctx);
 }
 
+void td_context_set_expected_frames(td_context_t *ctx, uint32_t frames_per_callback) {
+    if (!ctx) return;
+    ctx->expected_frames_per_callback = frames_per_callback;
+}
+
 void td_context_arm_first_host_time(td_context_t *ctx) {
     if (!ctx) return;
     atomic_store_explicit(&ctx->first_host_time_set, false, memory_order_relaxed);
@@ -231,7 +243,15 @@ void td_context_arm_first_host_time(td_context_t *ctx) {
 static void td_context_publish(td_context_t *ctx, uint64_t host_time, uint32_t frame_count) {
     /* Seqlock: bump to odd (write in progress), write fields, bump to even. */
     uint32_t seq = atomic_load_explicit(&ctx->seq, memory_order_relaxed);
-    atomic_store_explicit(&ctx->seq, seq + 1, memory_order_release);
+    atomic_store_explicit(&ctx->seq, seq + 1, memory_order_relaxed);
+    /* A release STORE on seq+1 only orders operations sequenced BEFORE it;
+     * the relaxed payload stores below could still be hoisted above it on
+     * weakly-ordered hardware (ARM64), letting a reader observe new payload
+     * values while both its seq loads still read the old even value — a torn
+     * snapshot accepted as consistent. A release FENCE here orders the seq+1
+     * store before every subsequent store, pairing with the reader's acquire
+     * fence to close that window. */
+    atomic_thread_fence(memory_order_release);
 
     bool already_set = atomic_load_explicit(&ctx->first_host_time_set, memory_order_relaxed);
     if (!already_set) {
@@ -265,7 +285,8 @@ void td_context_on_io_planar(td_context_t *ctx,
     if (!ctx) return;
 
     size_t total_bytes = plane_count * plane_bytes;
-    if (plane_count > TD_MAX_PLANES || total_bytes > ctx->planar_scratch_capacity || !ctx->planar_scratch) {
+    if (plane_count > TD_MAX_PLANES || total_bytes > ctx->planar_scratch_capacity || !ctx->planar_scratch
+        || (ctx->expected_frames_per_callback != 0 && frame_count != ctx->expected_frames_per_callback)) {
         /* Cannot safely concatenate: drop the whole chunk, matching the
          * standard drop-all-or-nothing overflow path. Record it through the
          * ring's own dropped-chunk/dropped-frame counters (so DrainLoop's

@@ -37,7 +37,7 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("Accelerate"),
-                .linkedFramework("UserNotifications")
+                .linkedFramework("AVFoundation") // CalibrationService tone playback
             ]
         ),
 
@@ -73,9 +73,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("SwiftUI"),
-                .linkedFramework("Carbon"),
-                .linkedFramework("AppIntents"),
-                .linkedFramework("UserNotifications")
+                .linkedFramework("Carbon") // HotkeyCenter's RegisterEventHotKey
             ]
         ),
 

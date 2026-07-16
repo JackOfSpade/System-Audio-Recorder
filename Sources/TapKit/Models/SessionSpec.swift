@@ -10,20 +10,17 @@ public struct SessionSpec: Sendable {
     public var excludeBundleIDs: [String]
     public var device: DevicePolicy
     public var muteBehavior: MuteBehavior
-    public var timelinePolicy: TimelinePolicy
     public var format: ExportFormat
 
     public init(
         excludeBundleIDs: [String] = [],
         device: DevicePolicy = .followSystemDefault,
         muteBehavior: MuteBehavior = .unmuted,
-        timelinePolicy: TimelinePolicy = .preserveWallClock,
         format: ExportFormat = .caf32
     ) {
         self.excludeBundleIDs = excludeBundleIDs
         self.device = device
         self.muteBehavior = muteBehavior
-        self.timelinePolicy = timelinePolicy
         self.format = format
     }
 }
@@ -36,9 +33,4 @@ public enum DevicePolicy: Sendable {
 public enum MuteBehavior: Sendable {
     case unmuted
     case mutedWhenTapped
-}
-
-public enum TimelinePolicy: String, Sendable, Codable {
-    case preserveWallClock
-    case compressTimeline
 }

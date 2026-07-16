@@ -15,31 +15,35 @@ public enum LaneState: Equatable, Sendable {
 
 public protocol CaptureLaneDelegate: AnyObject {
     func captureLane(_ lane: CaptureLane, didChangeState state: LaneState)
-    func captureLane(_ lane: CaptureLane, didAppendEvent event: EventEntry)
-    func captureLane(_ lane: CaptureLane, didOpenSegment segment: SegmentEntry)
-    func captureLane(_ lane: CaptureLane, didFinalizeSegment segment: SegmentEntry)
     /// Section 7.5: the lane gave up waiting for its `.fixed` device to
     /// return and finalized itself. The delegate (CaptureEngine) is
     /// responsible for finalizing the whole session and surfacing the
     /// device-wait-timeout notification at the UI layer.
     func captureLaneDidTimeOutWaitingForDevice(_ lane: CaptureLane)
+    /// A device-switch/rate-change rebuild or resume-from-waiting failed for
+    /// good: the lane has torn itself down and no further audio will be
+    /// captured. The delegate must finalize the session (saving whatever was
+    /// captured) and surface the error — without this, the engine/UI would
+    /// keep reporting "recording" while capturing nothing.
+    func captureLane(_ lane: CaptureLane, didFailPermanently message: String)
 }
 
 /// One independent capture pipeline: tap + private aggregate device + IOProc
 /// + ring buffer + drain thread + segment writer + watchdog (Section 4.2,
 /// Section 8.4). Every Core Audio lifecycle call for this lane runs on the
 /// `engineQueue` passed at init — the SAME serial queue `CaptureEngine` uses
-/// for every lane, satisfying the Section 4.4 serialization rule.
+/// (Section 4.4 serialization rule).
 public final class CaptureLane {
-    public let index: Int
     public let slug: String
     public weak var delegate: CaptureLaneDelegate?
 
-    public var recordedData: Data {
-        segmentWriter.data
-    }
     public var effectiveASBD: AudioStreamBasicDescription? {
         segmentWriter.asbd
+    }
+    /// The session's finished master segment files, in capture order. Read
+    /// after `stop()` has completed.
+    public var finishedSegments: [SegmentWriter.FinishedSegment] {
+        segmentWriter.finishedSegments
     }
 
     private let engineQueue: DispatchQueue
@@ -57,16 +61,16 @@ public final class CaptureLane {
     private var drainLoop: DrainLoop?
     private let segmentWriter: SegmentWriter
     private let watchdog: ZeroWatchdog
+    /// Owned by the lane (not by any one `DrainLoop`) so meter reads are safe
+    /// from any thread at any lifecycle moment — reading a `drainLoop`
+    /// property that the engine queue concurrently reassigns during a rebuild
+    /// would be a data race. The box itself is internally lock-guarded, and
+    /// meters survive rebuilds instead of blinking out.
+    private let meterBox = MeterSnapshotBox()
 
     private var deviceObserver: DeviceObserver?
-    private var waitingForDeviceUID: String?
-    private var waitingForDeviceDeadline: Date?
     private var waitingForDeviceTimeoutTimer: DispatchSourceTimer?
     private var waitForDeviceTimeout: TimeInterval = 300 // 5 minutes, Section 7.5
-
-    private var currentSegment: SegmentEntry?
-    private var pendingEvents: [EventEntry] = []
-    private var pendingSegments: [SegmentEntry] = []
 
     // Corroboration (Section 8.1) is documented as a 1Hz signal, but the
     // drain thread previously called the underlying HAL enumeration
@@ -80,6 +84,7 @@ public final class CaptureLane {
     // result; the drain thread only ever does a cheap lock-guarded read.
     private let corroborationCacheLock = NSLock()
     private var cachedAudioExpected = false
+    private var cachedCorroborationErrored = false
     private var cachedCorroborationPolledAt = Date.distantPast
     private var corroborationTimer: DispatchSourceTimer?
 
@@ -92,17 +97,16 @@ public final class CaptureLane {
     private lazy var deviceObserverBridge: DeviceObserverBridge = DeviceObserverBridge(lane: self)
 
     public init(
-        index: Int,
         slug: String,
         spec: SessionSpec,
-        engineQueue: DispatchQueue
+        engineQueue: DispatchQueue,
+        masterDirectory: URL
     ) {
-        self.index = index
         self.slug = slug
         self.spec = spec
         self.engineQueue = engineQueue
         self.ownPID = ProcessInfo.processInfo.processIdentifier
-        self.segmentWriter = SegmentWriter()
+        self.segmentWriter = SegmentWriter(directory: masterDirectory)
         self.watchdog = ZeroWatchdog()
         self.watchdog.delegate = watchdogBridge
         startCorroborationPolling()
@@ -116,9 +120,15 @@ public final class CaptureLane {
         timer.schedule(deadline: .now(), repeating: 1.0)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            // nil = the HAL enumeration itself failed. That must surface as
+            // `errored` (Section 8.1's stale-or-errored fallback), NOT as
+            // "no one is playing" — the latter holds the watchdog in
+            // SUSPICIOUS forever, silently disabling Bug-B recovery for as
+            // long as the enumeration keeps failing.
             let audioExpected = ProcessCatalog.isAnyRelevantProcessOutputting(excludingPIDs: [self.ownPID])
             self.corroborationCacheLock.lock()
-            self.cachedAudioExpected = audioExpected
+            self.cachedAudioExpected = audioExpected ?? false
+            self.cachedCorroborationErrored = (audioExpected == nil)
             self.cachedCorroborationPolledAt = Date()
             self.corroborationCacheLock.unlock()
         }
@@ -154,7 +164,15 @@ public final class CaptureLane {
             if !isRetry {
                 Log.error("lane \(slug): start attempt failed, retrying once in 250ms: \(error)")
                 engineQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                    self?.prepareAndStart(isRetry: true, completion: completion)
+                    guard let self else { return }
+                    // A stop() that raced in during the 250ms backoff moved
+                    // the lane out of .preparing — retrying now would
+                    // resurrect a pipeline the caller believes never started.
+                    guard self.state == .preparing else {
+                        completion(.failure(CaptureLaneError.canceled))
+                        return
+                    }
+                    self.prepareAndStart(isRetry: true, completion: completion)
                 }
             } else {
                 Log.error("lane \(slug): start failed after retry: \(error)")
@@ -164,16 +182,15 @@ public final class CaptureLane {
         }
     }
 
-    /// The Section 4.5 recipe end to end: resolve process ids for this
-    /// lane's apps, create the tap+aggregate via TapFactory, allocate the
-    /// ring/context, register the IOProc, start it, open the first segment
-    /// (unless `reuseExistingSegment` is true), and start the drain thread.
+    /// The Section 4.5 recipe end to end: resolve the device, create the
+    /// tap+aggregate via TapFactory, allocate the ring/context, register the
+    /// IOProc, start it, open the first segment (unless `reuseExistingSegment`
+    /// is true and one is already open), and start the drain thread.
     ///
     /// `reuseExistingSegment`: true for watchdog-triggered rebuilds only
     /// (Section 8.1/8.2) — the segment file must stay open across Bug-B
-    /// recovery, no rotation. The caller is responsible for having already
-    /// finalized `currentSegment` when it wants a NEW segment opened (device
-    /// switch / rate change rebuilds do this before calling rebuild()).
+    /// recovery, no rotation. Rotation paths (device switch / rate change)
+    /// finalize the open segment first, so a fresh one is opened here.
     private func buildAndRun(reuseExistingSegment: Bool) throws {
         let excludeIDs = resolveExcludeProcessObjectIDs()
 
@@ -205,6 +222,10 @@ public final class CaptureLane {
         }
         ring = newRing
         context = newContext
+        // Section 5.3 planar framing contract: the drain side parses planar
+        // ring content as fixed bufferFrameSize-frame blocks, so the producer
+        // must drop any odd-sized planar chunk rather than desync the stream.
+        td_context_set_expected_frames(newContext, bufferFrameSize)
         td_context_arm_first_host_time(newContext)
 
         let host = try IOProcHost(aggregateID: handle.aggregateID, context: newContext, interleaved: isInterleaved)
@@ -218,20 +239,19 @@ public final class CaptureLane {
             sampleRate: handle.effectiveFormat.mSampleRate,
             planar: !isInterleaved,
             segmentWriter: segmentWriter,
-            framesPerCallback: bufferFrameSize
+            framesPerCallback: bufferFrameSize,
+            meterBox: meterBox
         )
         loop.delegate = drainDelegateBridge
         drainLoop = loop
 
-        if !reuseExistingSegment || currentSegment == nil {
+        if !reuseExistingSegment || !segmentWriter.hasOpenSegment {
             let asbd = SegmentWriter.canonicalASBD(sampleRate: handle.effectiveFormat.mSampleRate, channels: UInt32(channels))
-            let segment = try segmentWriter.openNextSegment(asbd: asbd)
-            currentSegment = makeSegmentEntry(from: segment)
-            delegate?.captureLane(self, didOpenSegment: currentSegment!)
+            let url = try segmentWriter.openNextSegment(asbd: asbd)
+            Log.info("lane \(slug): opened segment \(url.lastPathComponent) @ \(Int(asbd.mSampleRate))Hz, \(channels)ch")
         }
-        // else: watchdog rebuild — `segmentWriter.current`/`currentSegment`
-        // were never touched by teardown(), so writes continue landing in
-        // the same already-open CAF segment (Section 8.1).
+        // else: watchdog rebuild — the already-open CAF segment keeps
+        // receiving writes across Bug-B recovery (Section 8.1).
 
         try host.start()
         loop.start()
@@ -298,28 +318,12 @@ public final class CaptureLane {
         return ids
     }
 
-    private func makeSegmentEntry(from segment: SegmentWriter.OpenSegment) -> SegmentEntry {
-        var ts = td_timestamps_t()
-        if let context {
-            td_context_read_timestamps(context, &ts)
-        }
-        return SegmentEntry(
-            index: segment.index,
-            file: "\(slug)/\(segment.url.lastPathComponent)",
-            startWallTime: ManifestTimestamp.now(),
-            startHostTime: "\(ts.first_host_time)",
-            sampleRate: segment.asbd.mSampleRate,
-            channels: Int(segment.asbd.mChannelsPerFrame),
-            frames: nil,
-            finalized: false
-        )
-    }
-
     // MARK: Teardown (Section 8.2 — STRICT order, canonical)
 
     /// AudioDeviceStop -> AudioDeviceDestroyIOProcID -> DestroyAggregateDevice
-    /// -> DestroyProcessTap. Tolerates non-noErr at every step; always
-    /// continues (TapFactory.destroy / IOProcHost already do this).
+    /// -> DestroyProcessTap -> final drain -> destroy ring/context. Tolerates
+    /// non-noErr at every step; always continues (TapFactory.destroy /
+    /// IOProcHost already do this).
     private func teardown() {
         stopObservingDevice()
         teardownCoreAudioObjectsOnly()
@@ -330,6 +334,12 @@ public final class CaptureLane {
     /// listener must stay alive to detect the device's return — tearing it
     /// down (as full `teardown()` does) would leave no mechanism left that
     /// could ever notice the device coming back.
+    ///
+    /// Ordering matters: the IOProc is stopped BEFORE the drain thread is
+    /// asked to finish, so the final drain pass empties everything the
+    /// IOProc produced up to the very last callback. Stopping the drain
+    /// first (the previous order in stop()/rebuild()) silently discarded
+    /// the last IO-cycle-or-two of audio at every stop and rotation.
     private func teardownCoreAudioObjectsOnly() {
         ioProcHost?.stop()
         ioProcHost?.destroyIOProc()
@@ -339,14 +349,9 @@ public final class CaptureLane {
         }
         tapHandle = nil
         // `drainLoop` reads from `ring`/`context`, both destroyed just
-        // below. `buildAndRun()` assigns a new DrainLoop to `self.drainLoop`
-        // well before it could still throw later (e.g. opening the segment
-        // file) — every caller of `teardownCoreAudioObjectsOnly()` on a
-        // throw path used to leave that stale DrainLoop in place, pointing
-        // at already-destroyed C objects. `stopAndDrainFully()` is a safe,
-        // instant no-op if this particular DrainLoop's thread was never
-        // started (the common case here) or was already stopped by the
-        // caller.
+        // below — the drain thread must have fully exited before they go.
+        // `stopAndDrainFully()` is a safe no-op if this DrainLoop's thread
+        // was never started.
         drainLoop?.stopAndDrainFully()
         drainLoop = nil
         if let context {
@@ -357,26 +362,68 @@ public final class CaptureLane {
             td_ring_destroy(ring)
         }
         ring = nil
+        // Stale meters must not survive the pipeline (e.g. into
+        // WAITING_FOR_DEVICE, where the CLI's silence-stop logic reads them).
+        meterBox.publish(.empty)
     }
 
     /// Full teardown + full recreation (Section 8.2). Never a partial
-    /// restart — known-ineffective against Bug B. `reuseExistingSegment`
-    /// is threaded straight through to `buildAndRun`.
-    private func rebuild(reuseExistingSegment: Bool, completion: @escaping (Bool) -> Void) {
+    /// restart — known-ineffective against Bug B.
+    ///
+    /// `rotateSegment`: true for device-switch/rate-change rebuilds — the
+    /// open segment is finalized (AFTER the final drain, so nothing is lost)
+    /// and `buildAndRun` opens a fresh one with the new device's ASBD.
+    /// False for watchdog (Bug-B) rebuilds, which keep the segment open.
+    private func rebuild(rotateSegment: Bool, completion: @escaping (Bool) -> Void) {
         engineQueue.async { [weak self] in
             guard let self else { return }
+            // A rebuild request that raced a stop()/timeout must not
+            // resurrect a lane the owner believes is fully stopped.
+            guard self.state == .running || self.state == .rebuilding else {
+                completion(false)
+                return
+            }
             self.state = .rebuilding
-            self.drainLoop?.stopAndDrainFully()
+            if rotateSegment {
+                // The imminent full rebuild supersedes any scheduled watchdog
+                // work (a pending backoff rebuild OR a 60s ESCALATED retry) —
+                // letting either fire afterward would tear down the freshly
+                // rebuilt pipeline or churn guard-rejected phantom attempts.
+                // The watchdog resets to NORMAL so zeros on the NEW pipeline
+                // re-confirm from scratch. (Not done for watchdog-initiated
+                // rebuilds: rebuildCompleted drives that state machine.)
+                self.watchdog.resetForExternalRebuild()
+            }
             self.teardown()
+            if rotateSegment {
+                self.finalizeOpenSegment()
+            }
             do {
-                try self.buildAndRun(reuseExistingSegment: reuseExistingSegment)
+                try self.buildAndRun(reuseExistingSegment: !rotateSegment)
                 self.state = .running
                 completion(true)
             } catch {
+                Log.error("lane \(self.slug): rebuild failed: \(error)")
                 self.teardownCoreAudioObjectsOnly()
-                self.state = .failed("\(error)")
+                if rotateSegment {
+                    self.state = .failed("\(error)")
+                } else {
+                    // Watchdog (Bug-B) rebuild failures are NOT terminal: the
+                    // watchdog owns the retry policy (0.5/2/5s backoff, then
+                    // 60s ESCALATED retries) and the entry guard above must
+                    // let the next attempt back in — a `.failed` state here
+                    // would make the first transient failure permanent.
+                    self.state = .rebuilding
+                }
                 completion(false)
             }
+        }
+    }
+
+    private func finalizeOpenSegment() {
+        let result = segmentWriter.finalizeCurrentSegment()
+        if result.succeeded {
+            Log.info("lane \(slug): finalized segment (\(result.frames) frames)")
         }
     }
 
@@ -390,24 +437,45 @@ public final class CaptureLane {
             self.waitingForDeviceTimeoutTimer = nil
             self.corroborationTimer?.cancel()
             self.corroborationTimer = nil
-            // A backoff-delayed watchdog rebuild request scheduled just
-            // before stop() was called would otherwise still fire
-            // afterward and resurrect this lane's Core Audio pipeline even
-            // though the caller believes the session is fully stopped.
+            // Sticky: from here on the watchdog can neither fire a pending
+            // backoff-delayed rebuild nor re-arm one from the final drain
+            // passes below — either would resurrect this lane's Core Audio
+            // pipeline even though the caller believes the session is fully
+            // stopped.
             self.watchdog.invalidate()
-            self.drainLoop?.stopAndDrainFully()
             self.teardown()
-            if var segment = self.currentSegment {
-                let result = self.segmentWriter.finalizeCurrentSegment()
-                segment.frames = Int(result.frames)
-                segment.finalized = result.succeeded
-                self.currentSegment = nil
-                self.delegate?.captureLane(self, didFinalizeSegment: segment)
-            }
+            self.finalizeOpenSegment()
             self.state = .finalizing
             self.state = .idle
             completion()
         }
+    }
+
+    /// Deletes every master segment file this lane produced. For sessions
+    /// that failed to start or captured nothing worth keeping.
+    public func removeAllSegmentFiles() {
+        segmentWriter.removeAllSegmentFiles()
+    }
+
+    /// Releases the session-liveness lock once the engine has consumed the
+    /// finished segments (exported or attempted). See
+    /// `SegmentWriter.releaseSessionLock`.
+    public func releaseSessionLock() {
+        segmentWriter.releaseSessionLock()
+    }
+
+    /// A rotation/resume rebuild failed for good: finish tearing down
+    /// (observer, timers, watchdog) so nothing leaks while the lane sits in
+    /// `.failed`, finalize whatever was captured, and hand the session back
+    /// to the delegate to save and surface.
+    private func handlePermanentFailure(_ message: String) {
+        Log.error("lane \(slug): \(message)")
+        waitingForDeviceTimeoutTimer?.cancel()
+        waitingForDeviceTimeoutTimer = nil
+        watchdog.invalidate()
+        teardown()
+        finalizeOpenSegment()
+        delegate?.captureLane(self, didFailPermanently: message)
     }
 
     // MARK: Device switch / rate change (Section 7.3/7.4/7.5)
@@ -434,12 +502,12 @@ public final class CaptureLane {
 
     fileprivate func handleDefaultOutputChanged() {
         guard state == .running else { return }
-        rotateSegmentThenRebuild(eventType: .deviceSwitch)
+        rotateSegmentThenRebuild(reason: "default output device changed")
     }
 
     fileprivate func handleNominalRateChanged(deviceID: AudioObjectID) {
         guard state == .running else { return }
-        rotateSegmentThenRebuild(eventType: .rateChange)
+        rotateSegmentThenRebuild(reason: "device sample rate changed")
     }
 
     fileprivate func handleDeviceListChanged() {
@@ -455,21 +523,11 @@ public final class CaptureLane {
         }
     }
 
-    private func rotateSegmentThenRebuild(eventType: EventType) {
-        if var segment = currentSegment {
-            let result = segmentWriter.finalizeCurrentSegment()
-            segment.frames = Int(result.frames)
-            segment.finalized = result.succeeded
-            currentSegment = nil
-            delegate?.captureLane(self, didFinalizeSegment: segment)
-        }
-        rebuild(reuseExistingSegment: false) { [weak self] success in
-            guard let self, success else { return }
-            let event = EventEntry(
-                type: eventType, atWallTime: ManifestTimestamp.now(),
-                framePosition: 0, gapMs: nil, details: .object([:])
-            )
-            self.delegate?.captureLane(self, didAppendEvent: event)
+    private func rotateSegmentThenRebuild(reason: String) {
+        Log.info("lane \(slug): \(reason) — rotating segment and rebuilding")
+        rebuild(rotateSegment: true) { [weak self] success in
+            guard let self, !success else { return }
+            self.handlePermanentFailure("Rebuild after \(reason) failed twice; capture cannot continue")
         }
     }
 
@@ -479,31 +537,17 @@ public final class CaptureLane {
     /// teardown would remove the only mechanism left to notice that.
     private func enterWaitingForDevice(deviceUID: String) {
         state = .waitingForDevice
-        // Same reasoning as `stop()`: no Core Audio pipeline exists to
-        // rebuild while waiting for the device to return, so a pending
-        // backoff-delayed rebuild request must not be allowed to fire here.
-        watchdog.invalidate()
-        if var segment = currentSegment {
-            let result = segmentWriter.finalizeCurrentSegment()
-            segment.frames = Int(result.frames)
-            segment.finalized = result.succeeded
-            currentSegment = nil
-            delegate?.captureLane(self, didFinalizeSegment: segment)
-        }
-        // Stop the drain thread BEFORE destroying the ring/context it reads
-        // from — otherwise a still-running drain thread would use-after-free
-        // the ring on the next td_ring_read once teardownCoreAudioObjectsOnly
-        // destroys it.
-        drainLoop?.stopAndDrainFully()
-        drainLoop = nil
+        // No Core Audio pipeline exists to rebuild while waiting for the
+        // device to return, so all scheduled watchdog work (backoff rebuild
+        // AND 60s ESCALATED retry) must be cancelled and the episode reset.
+        // (Not the sticky invalidate — the watchdog must come back to life
+        // if the device returns.)
+        watchdog.resetForExternalRebuild()
+        // IOProc stop -> final drain -> destroy, THEN finalize: the segment
+        // gets every frame the (now dead) device delivered before vanishing.
         teardownCoreAudioObjectsOnly()
-        waitingForDeviceUID = deviceUID
-        waitingForDeviceDeadline = Date().addingTimeInterval(waitForDeviceTimeout)
-        let event = EventEntry(
-            type: .waitingForDevice, atWallTime: ManifestTimestamp.now(),
-            framePosition: 0, gapMs: nil, details: .object(["resumed": .bool(false)])
-        )
-        delegate?.captureLane(self, didAppendEvent: event)
+        finalizeOpenSegment()
+        Log.info("lane \(slug): device \(deviceUID) disappeared — waiting up to \(Int(waitForDeviceTimeout))s for it to return")
 
         let timer = DispatchSource.makeTimerSource(queue: engineQueue)
         timer.schedule(deadline: .now() + waitForDeviceTimeout)
@@ -519,15 +563,10 @@ public final class CaptureLane {
     private func resumeFromWaitingForDevice() {
         waitingForDeviceTimeoutTimer?.cancel()
         waitingForDeviceTimeoutTimer = nil
-        waitingForDeviceUID = nil
-        waitingForDeviceDeadline = nil
+        Log.info("lane \(slug): device returned — resuming capture")
         prepareAndStart(isRetry: false) { [weak self] result in
-            guard let self, case .success = result else { return }
-            let event = EventEntry(
-                type: .waitingForDevice, atWallTime: ManifestTimestamp.now(),
-                framePosition: 0, gapMs: nil, details: .object(["resumed": .bool(true)])
-            )
-            self.delegate?.captureLane(self, didAppendEvent: event)
+            guard let self, case .failure(let error) = result else { return }
+            self.handlePermanentFailure("Device returned but capture could not be rebuilt: \(error)")
         }
     }
 
@@ -537,8 +576,6 @@ public final class CaptureLane {
     private func handleWaitingForDeviceTimeout() {
         guard state == .waitingForDevice else { return }
         waitingForDeviceTimeoutTimer = nil
-        waitingForDeviceUID = nil
-        waitingForDeviceDeadline = nil
         // The device never came back — nothing left to observe.
         // `enterWaitingForDevice` deliberately left `deviceObserver` alive
         // so it could detect a return; now that we're giving up, it must
@@ -546,21 +583,19 @@ public final class CaptureLane {
         // registered indefinitely even though this lane is about to report
         // itself idle.
         teardown()
+        Log.info("lane \(slug): device never returned within \(Int(waitForDeviceTimeout))s — finalizing session")
         state = .finalizing
         state = .idle
         delegate?.captureLaneDidTimeOutWaitingForDevice(self)
     }
 
-    // MARK: Watchdog corroboration input (Section 8.1)
-
-    public func updateCorroboration(_ snapshot: CorroborationSnapshot) {
-        watchdog.updateCorroboration(snapshot)
-    }
+    // MARK: Live status (any thread)
 
     /// Read-only meter snapshot for UI polling at 20 Hz (Section 5.4 step 8).
-    /// Safe from any thread: `MeterSnapshotBox` is internally lock-guarded.
-    public func currentMeterSnapshot() -> MeterSnapshot? {
-        drainLoop?.meterBox.read()
+    /// Safe from any thread: the lane-owned `MeterSnapshotBox` is internally
+    /// lock-guarded and survives rebuilds.
+    public func currentMeterSnapshot() -> MeterSnapshot {
+        meterBox.read()
     }
 
     /// Read-only watchdog state, e.g. for `--max-silence-stop` to distinguish
@@ -573,15 +608,18 @@ public final class CaptureLane {
 
 public enum CaptureLaneError: Error, CustomStringConvertible {
     case allocationFailed(String)
+    case canceled
     public var description: String {
         switch self {
         case .allocationFailed(let what): return "Failed to allocate \(what)"
+        case .canceled: return "Start was canceled by a concurrent stop"
         }
     }
 }
 
-/// Bridges `ZeroWatchdog`'s callbacks (fired on the DrainLoop thread) to the
-/// lane's rebuild machinery (which must run on the engine queue).
+/// Bridges `ZeroWatchdog`'s callbacks (fired on the DrainLoop thread or a
+/// backoff timer queue) to the lane's rebuild machinery (which must run on
+/// the engine queue).
 private final class WatchdogBridge: ZeroWatchdogDelegate {
     weak var lane: CaptureLane?
     init(lane: CaptureLane) { self.lane = lane }
@@ -608,6 +646,9 @@ private final class DrainDelegateBridge: DrainLoopDelegate {
     func drainLoop(_ loop: DrainLoop, overrunDroppedChunks: UInt64, droppedFrames: UInt64) {
         lane?.reportOverrunFromDrain(chunks: overrunDroppedChunks, frames: droppedFrames)
     }
+    func drainLoop(_ loop: DrainLoop, didFailWriting error: String) {
+        lane?.reportWriteFailureFromDrain(error)
+    }
 }
 
 private final class DeviceObserverBridge: DeviceObserverDelegate {
@@ -627,23 +668,21 @@ private final class DeviceObserverBridge: DeviceObserverDelegate {
 
 extension CaptureLane {
     fileprivate func rebuildFromWatchdog(attempt: Int) {
-        // reuseExistingSegment: true — Bug-B rebuilds never rotate the
-        // segment (Section 8.1: "the segment stays open across rebuilds").
-        rebuild(reuseExistingSegment: true) { [weak self] success in
+        // rotateSegment: false — Bug-B rebuilds never rotate the segment
+        // (Section 8.1: "the segment stays open across rebuilds"). Failure
+        // is NOT permanent here: the watchdog owns its own retry/escalation
+        // policy (backoff schedule, attempt budget, 60s ESCALATED retries).
+        rebuild(rotateSegment: false) { [weak self] success in
             self?.watchdog.rebuildCompleted(success: success)
         }
     }
 
     fileprivate func watchdogDidEscalate() {
-        let event = EventEntry(
-            type: .error, atWallTime: ManifestTimestamp.now(), framePosition: 0,
-            gapMs: nil, details: .object(["osStatus": .integer(0), "context": .string("watchdog escalated")])
-        )
-        delegate?.captureLane(self, didAppendEvent: event)
+        Log.error("lane \(slug): watchdog ESCALATED — Bug-B dropout persists after repeated rebuilds; retrying every 60s")
     }
 
     fileprivate func watchdogDidDeescalate() {
-        // Health chip / notification withdrawal is a GUI-layer concern.
+        Log.info("lane \(slug): watchdog recovered from ESCALATED")
     }
 
     fileprivate func reportZeroRunFromDrain(_ seconds: Double) {
@@ -651,22 +690,31 @@ extension CaptureLane {
         if watchdog.state != .normal {
             // Cheap lock-guarded read of the 1Hz-cached value — see
             // `startCorroborationPolling()`. `polledAt` is the time of the
-            // actual underlying poll, not this read, so the watchdog's own
-            // staleness check (Section 8.1) still correctly detects a
-            // stalled corroboration feed instead of always looking "fresh."
+            // actual underlying poll, not this read: the watchdog both
+            // detects a stalled corroboration feed (Section 8.1 freshness
+            // rule) and dedupes re-deliveries of the same poll, so feeding
+            // it every ~50ms drain cycle is safe.
             corroborationCacheLock.lock()
             let audioExpected = cachedAudioExpected
+            let errored = cachedCorroborationErrored
             let polledAt = cachedCorroborationPolledAt
             corroborationCacheLock.unlock()
-            watchdog.updateCorroboration(CorroborationSnapshot(audioExpected: audioExpected, polledAt: polledAt))
+            watchdog.updateCorroboration(CorroborationSnapshot(audioExpected: audioExpected, polledAt: polledAt, errored: errored))
         }
     }
 
     fileprivate func reportOverrunFromDrain(chunks: UInt64, frames: UInt64) {
-        let event = EventEntry(
-            type: .overrunGap, atWallTime: ManifestTimestamp.now(), framePosition: 0,
-            gapMs: nil, details: .object(["framesLost": .integer(Int(frames)), "chunks": .integer(Int(chunks))])
-        )
-        delegate?.captureLane(self, didAppendEvent: event)
+        Log.error("lane \(slug): ring overrun — dropped \(frames) frames across \(chunks) chunks")
+    }
+
+    /// Fired (once per DrainLoop) from the drain thread after ~1 s of
+    /// back-to-back segment-write failures — disk full or I/O error. Every
+    /// drained sample is being lost, so finalize the session and surface the
+    /// failure instead of letting stop() report success on a truncated file.
+    fileprivate func reportWriteFailureFromDrain(_ message: String) {
+        engineQueue.async { [weak self] in
+            guard let self, self.state == .running || self.state == .rebuilding else { return }
+            self.handlePermanentFailure("Recording writes are failing (\(message)) — disk full or I/O error")
+        }
     }
 }

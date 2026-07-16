@@ -14,7 +14,7 @@ struct OnboardingView: View {
             Image(systemName: "waveform")
                 .font(.system(size: 48))
             Text("Welcome to System Audio Recorder").font(.title)
-            Text("System Audio Recorder records the audio your Mac plays — system-wide or from apps you choose. macOS requires your permission for this.")
+            Text("System Audio Recorder records the system-wide mix of the audio your Mac plays. macOS requires your permission for this.")
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
 
@@ -37,6 +37,12 @@ struct OnboardingView: View {
                         NSWorkspace.shared.open(url)
                     }
                 }
+                // Without these, a denied prompt dead-ended onboarding: the
+                // only dismiss path lived in the .granted branch.
+                Button("Check Again") {
+                    appState.requestPermissionIfNeeded()
+                }
+                Button("Continue Anyway", action: onDismiss)
             }
         }
         .padding(32)

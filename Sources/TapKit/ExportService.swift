@@ -37,11 +37,8 @@ public enum ExportService {
         masterURL: URL,
         to destinationURL: URL,
         format: ExportFormat,
-        gainCompensationDB: Double?,
-        ditherEnabled: Bool = true
+        gainCompensationDB: Double?
     ) throws -> ExportResult {
-        _ = ditherEnabled
-
         var clientASBD = try readMasterFormat(masterURL)
         guard var readFile = try? openForReading(masterURL, clientFormat: &clientASBD) else {
             throw ExportError.sourceUnreadable

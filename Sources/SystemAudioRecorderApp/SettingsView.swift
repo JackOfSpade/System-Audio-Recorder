@@ -13,10 +13,8 @@ struct SettingsView: View {
     @AppStorage("recordingsFolder") private var recordingsFolder: String = "~/Music/System Audio Recorder/"
     @AppStorage("namingTemplate") private var namingTemplate: String = "{date} {time} — {source}"
     @AppStorage("recordingFormat") private var recordingFormat: String = ExportFormat.caf32.rawValue
-    @AppStorage("timelinePolicy") private var timelinePolicy: String = TimelinePolicy.preserveWallClock.rawValue
     @AppStorage("silentCapture") private var silentCapture: Bool = false
     @AppStorage("bufferFrameSize") private var bufferFrameSize: Double = 512
-    @AppStorage("forcedRateEnabled") private var forcedRateEnabled: Bool = false
 
     enum Section: String, CaseIterable, Identifiable {
         case general   = "General"
@@ -121,14 +119,6 @@ struct SettingsView: View {
             panelHeader("Recording", icon: "record.circle")
 
             settingsGroup("Behaviour") {
-                LabeledField("Timeline policy") {
-                    Picker("", selection: $timelinePolicy) {
-                        Text("Preserve wall clock").tag(TimelinePolicy.preserveWallClock.rawValue)
-                        Text("Compress timeline").tag(TimelinePolicy.compressTimeline.rawValue)
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: 240)
-                }
                 Toggle("Silent capture — mute system output while recording", isOn: $silentCapture)
             }
         }
@@ -173,17 +163,6 @@ struct SettingsView: View {
     private var advancedPanel: some View {
         VStack(alignment: .leading, spacing: 20) {
             panelHeader("Advanced", icon: "wrench.and.screwdriver")
-
-            settingsGroup("Audio Engine") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Force capture rate", isOn: $forcedRateEnabled)
-                    if forcedRateEnabled {
-                        Text("Forcing a rate different from the output device's current rate makes macOS resample audio before capture. Only enable if a fixed rate is more important than maximum fidelity.")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-                }
-            }
 
             settingsGroup("Calibration") {
                 VStack(alignment: .leading, spacing: 4) {

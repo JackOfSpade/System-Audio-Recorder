@@ -26,23 +26,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         registerHotkeys()
 
+        // Section 6.2's mandatory launch-time guard against a file-layer
+        // regression. The CLI refuses to record on failure; the GUI warns
+        // loudly instead of silently producing untrustworthy files.
+        if !SegmentWriter.runBitExactSelfCheck(scratchDirectory: FileManager.default.temporaryDirectory) {
+            Log.error("bit-exact file-layer self-check FAILED at launch")
+            let alert = NSAlert()
+            alert.messageText = "Audio file self-check failed"
+            alert.informativeText = "The Float32 bit-exact write/read-back check failed at launch. Recordings on this system may be corrupted — see \(Log.fileURL.path)."
+            alert.alertStyle = .critical
+            alert.runModal()
+        }
+
         if !UserDefaults.standard.bool(forKey: Self.hasOnboardedKey) {
             showOnboarding()
         }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard appState.isRecording else { return .terminateNow }
-        // Silently refusing to quit (the previous behavior) left no way for
-        // the user to tell whether Cmd+Q had done anything at all.
-        let alert = NSAlert()
-        alert.messageText = "Recording in progress"
-        alert.informativeText = "System Audio Recorder is currently recording. Stop the recording before quitting, or quit anyway to stop it now and finalize the recording."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Stop Recording and Quit")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        // Quit while fully idle: nothing to finalize.
+        if !appState.isRecording && !appState.isBusy { return .terminateNow }
 
+        if appState.isRecording {
+            // Silently refusing to quit (the previous behavior) left no way
+            // for the user to tell whether Cmd+Q had done anything at all.
+            let alert = NSAlert()
+            alert.messageText = "Recording in progress"
+            alert.informativeText = "System Audio Recorder is currently recording. Stop the recording before quitting, or quit anyway to stop it now and finalize the recording."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Stop Recording and Quit")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
+
+        // Also covers a start/stop still in flight (isBusy): the reply is
+        // queued behind the in-flight operation, so the process can never
+        // exit while the export is still writing the recording out.
         appState.stop {
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -127,7 +146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showOnboarding() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 440, height: 360),
-            styleMask: [.titled], backing: .buffered, defer: false
+            // .closable: with permission denied, the "Done" path is never
+            // reachable — without a close button the window was permanently
+            // stuck on screen (and back on every launch).
+            styleMask: [.titled, .closable], backing: .buffered, defer: false
         )
         window.title = "Welcome to System Audio Recorder"
         window.center()

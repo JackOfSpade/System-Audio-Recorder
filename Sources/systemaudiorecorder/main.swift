@@ -45,6 +45,24 @@ struct ArgParser {
         }
         return args[idx + 1]
     }
+
+    /// Rejects unknown or mistyped options up front (Section 3.8: usage
+    /// errors exit 64). Without this, a typo like `--durration 600` was
+    /// silently ignored — recording unbounded instead of for 10 minutes.
+    /// `options` consume the following token as their value; `flags` don't.
+    func validate(flags: Set<String>, options: Set<String>) {
+        var index = 0
+        while index < args.count {
+            let token = args[index]
+            if options.contains(token) {
+                index += 2 // a missing value is caught by value(_:)
+            } else if flags.contains(token) {
+                index += 1
+            } else {
+                fail(.usage, "Unknown option '\(token)'.")
+            }
+        }
+    }
 }
 
 // MARK: --device resolution (Section 3.8 / 7.2 — owning surface here)
@@ -78,9 +96,17 @@ func recordingsRoot(from parser: ArgParser) -> URL {
 // MARK: record
 
 func runRecord(_ parser: ArgParser) -> Never {
+    parser.validate(flags: [], options: ["--device", "--duration", "--max-silence-stop", "--format", "--out"])
+
     let permission = PermissionBroker.requestCapturePermission()
     guard permission == .granted else {
         fail(.permissionDenied, "System audio capture permission was not granted. Open System Settings > Privacy & Security > Screen & System Audio Recording.")
+    }
+
+    // Section 6.2's mandatory launch-time guard: if the file layer can't
+    // round-trip Float32 bit-exactly, refuse to record at all.
+    guard SegmentWriter.runBitExactSelfCheck(scratchDirectory: FileManager.default.temporaryDirectory) else {
+        fail(.captureError, "Bit-exact file-layer self-check failed — refusing to record. See \(Log.fileURL.path).")
     }
 
     var device: DevicePolicy = .followSystemDefault
@@ -124,6 +150,8 @@ func runRecord(_ parser: ArgParser) -> Never {
 
     let spec = SessionSpec(device: device, format: format)
     let engine = CaptureEngine(recordingsRoot: recordingsRoot(from: parser))
+    // Rescue any partial master a crashed previous run left behind.
+    engine.sessionStore.sweepPartialCaptures()
 
     let startSemaphore = DispatchSemaphore(value: 0)
     var startError: Error?
@@ -139,7 +167,7 @@ func runRecord(_ parser: ArgParser) -> Never {
     if let startError {
         fail(.captureError, "Failed to start recording: \(startError)")
     }
-    stderrLine("[\(ManifestTimestamp.now())] Recording started...")
+    stderrLine("[\(Timestamp.now())] Recording started...")
 
     var shouldStop = false
     let stopLock = NSLock()
@@ -163,13 +191,13 @@ func runRecord(_ parser: ArgParser) -> Never {
     let signalQueue = DispatchQueue(label: "com.systemaudiorecorder.cli.signal")
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
     sigintSource.setEventHandler {
-        stderrLine("[\(ManifestTimestamp.now())] Ctrl-C received, finalizing…")
+        stderrLine("[\(Timestamp.now())] Ctrl-C received, finalizing…")
         requestStop()
     }
     sigintSource.resume()
     let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
     sigtermSource.setEventHandler {
-        stderrLine("[\(ManifestTimestamp.now())] SIGTERM received, finalizing…")
+        stderrLine("[\(Timestamp.now())] SIGTERM received, finalizing…")
         requestStop()
     }
     sigtermSource.resume()
@@ -181,30 +209,38 @@ func runRecord(_ parser: ArgParser) -> Never {
         Thread.sleep(forTimeInterval: 0.2)
         stopLock.lock(); let stop = shouldStop; stopLock.unlock()
         if stop { break }
+        // The engine can finalize the session on its own: a `.fixed` device
+        // that never returned within the 5-minute wait (Section 3.8: exit 0,
+        // a valid session was produced), or a permanent mid-session failure.
+        // Without this check the loop would sleep forever — meters are empty
+        // once the engine self-stops, so the silence path can't fire either.
+        if case .recording = engine.status {} else {
+            stderrLine("[\(Timestamp.now())] Engine finalized the session on its own, collecting result…")
+            break
+        }
         if let deadline, Date() >= deadline {
-            stderrLine("[\(ManifestTimestamp.now())] --duration elapsed, finalizing…")
+            stderrLine("[\(Timestamp.now())] --duration elapsed, finalizing…")
             break
         }
         if let maxSilenceStopSeconds {
-            // Digital silence counts only while every lane has a real meter
+            // Digital silence counts only while every lane has a live meter
             // snapshot AND its watchdog is NOT actively handling a confirmed
             // Bug-B dropout — during recovery the zeros are the OS bug, not
             // real silence, and stopping would cut off an in-flight rebuild
-            // (Section 3.8). `meterSnapshots()`/`watchdogStates()` are
-            // index-aligned per lane (nil means "no snapshot yet", e.g.
-            // still preparing) — a missing snapshot blocks the stop rather
-            // than being silently skipped, which previously could misalign
-            // this zip against the wrong lane's watchdog state entirely.
+            // (Section 3.8). An `.empty` snapshot (pipeline not up yet, or
+            // parked in WAITING_FOR_DEVICE) has zeroRunSeconds == 0 and so
+            // blocks the stop rather than counting as silence.
             let snapshots = engine.meterSnapshots()
             let states = engine.watchdogStates()
             let genuinelySilent = !snapshots.isEmpty && zip(snapshots, states).allSatisfy { snapshot, state in
-                guard let snapshot else { return false }
-                return snapshot.zeroRunSeconds > 0 && ![.confirmedDropout, .rebuilding, .postRebuildVerify].contains(state)
+                // .escalated is also active recovery (retrying every 60s per
+                // Section 8.1 — "ESCALATED keeps recording"), not silence.
+                snapshot.zeroRunSeconds > 0 && ![.confirmedDropout, .rebuilding, .postRebuildVerify, .escalated].contains(state)
             }
             if genuinelySilent {
                 if silenceStartedAt == nil { silenceStartedAt = Date() }
                 if let started = silenceStartedAt, Date().timeIntervalSince(started) >= maxSilenceStopSeconds {
-                    stderrLine("[\(ManifestTimestamp.now())] --max-silence-stop threshold reached, finalizing…")
+                    stderrLine("[\(Timestamp.now())] --max-silence-stop threshold reached, finalizing…")
                     break
                 }
             } else {
@@ -213,25 +249,43 @@ func runRecord(_ parser: ArgParser) -> Never {
         }
     }
 
+    // For a session the engine already finalized itself, stop() is a no-op
+    // that reports that session's recorded outcome (saved URLs included).
     let stopSemaphore = DispatchSemaphore(value: 0)
-    var finalFileURL: URL?
-    engine.stop { url in
-        finalFileURL = url
+    var stopOutcome: CaptureEngine.StopOutcome?
+    engine.stop { outcome in
+        stopOutcome = outcome
         stopSemaphore.signal()
     }
     stopSemaphore.wait()
 
-    guard let finalFileURL else {
-        fail(.diskError, "Recording captured, but the file could not be exported to disk. Check available disk space.")
+    let outcome = stopOutcome ?? CaptureEngine.StopOutcome(fileURLs: [], failure: .nothingCaptured)
+    for url in outcome.fileURLs {
+        print(url.path)
     }
-
-    print(finalFileURL.path)
-    exit(ExitCode.ok.rawValue)
+    if !outcome.fileURLs.isEmpty {
+        // Files were saved — that's a success for scripting purposes, even
+        // if the session ended abnormally (the reason went to stderr/log).
+        if case .error(let message) = engine.status {
+            stderrLine("[\(Timestamp.now())] Note: \(message)")
+        }
+        exit(ExitCode.ok.rawValue)
+    }
+    switch outcome.failure {
+    case .exportFailed(let detail):
+        fail(.diskError, "Recording captured, but export failed: \(detail). The raw .capture_*.caf master was left in the recordings folder.")
+    case .nothingCaptured, .none:
+        if case .error(let message) = engine.status {
+            fail(.captureError, message)
+        }
+        fail(.captureError, "No audio was captured to save.")
+    }
 }
 
 // MARK: devices / apps / sessions
 
 func runDevices(_ parser: ArgParser) -> Never {
+    parser.validate(flags: ["--json"], options: [])
     let json = parser.flag("--json")
     guard let ids = try? AudioDeviceDirectory.allDevices() else {
         fail(.captureError, "Could not enumerate devices")
@@ -260,6 +314,7 @@ func runDevices(_ parser: ArgParser) -> Never {
 }
 
 func runApps(_ parser: ArgParser) -> Never {
+    parser.validate(flags: ["--json"], options: [])
     let json = parser.flag("--json")
     guard let processes = try? ProcessCatalog.allProcesses() else {
         fail(.captureError, "Could not enumerate processes")
@@ -283,6 +338,7 @@ func runApps(_ parser: ArgParser) -> Never {
 // MARK: calibrate
 
 func runCalibrate(_ parser: ArgParser) -> Never {
+    parser.validate(flags: [], options: ["--device"])
     let deviceID: AudioObjectID
     if let deviceArg = parser.value("--device") {
         deviceID = resolveDevice(deviceArg)

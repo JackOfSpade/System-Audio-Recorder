@@ -252,7 +252,7 @@ public enum CalibrationService {
                 }
 
                 saveBufferSizeCalibration(BufferSizeCalibration(
-                    deviceUID: deviceUID, frameSize: selected, measuredAt: ManifestTimestamp.now()
+                    deviceUID: deviceUID, frameSize: selected, measuredAt: Timestamp.now()
                 ))
 
                 completion(.success(BufferCalibrationResult(
@@ -282,6 +282,17 @@ public enum CalibrationService {
                 guard let deviceID = try AudioDeviceDirectory.findDevice(byUID: deviceUID) else {
                     throw CalibrationError.deviceNotFound
                 }
+                // The tone below plays via AVAudioPlayer, which always
+                // renders to the system DEFAULT output — there is no
+                // per-player device routing. Calibrating any other device
+                // would measure the default device's Bug-A attenuation and
+                // store it under the target's key: a silently wrong profile
+                // later multiplied into exports. Refuse instead.
+                let defaultID = try AudioDeviceDirectory.defaultOutputDevice()
+                guard defaultID == deviceID else {
+                    let name = (try? AudioDeviceDirectory.deviceName(deviceID)) ?? deviceUID
+                    throw CalibrationError.deviceNotDefaultOutput(name)
+                }
                 let channelCount = try AudioDeviceDirectory.outputChannelCount(deviceID)
 
                 let capturedRMSdB = try captureToneAndMeasure(deviceID: deviceID, deviceUID: deviceUID)
@@ -293,7 +304,7 @@ public enum CalibrationService {
                     outputChannelCount: channelCount,
                     macOSBuild: macOSBuild,
                     gainCompensationDB: gainCompensationDB,
-                    measuredAt: ManifestTimestamp.now(),
+                    measuredAt: Timestamp.now(),
                     referenceVolume: nil // Section 11 R1: pre/post-volume question needs hands-on verification
                 )
                 saveProfile(profile)
@@ -483,6 +494,7 @@ public enum CalibrationService {
 
 public enum CalibrationError: Error, CustomStringConvertible {
     case deviceNotFound
+    case deviceNotDefaultOutput(String)
     case permissionDenied
     case allocationFailed
     case noSamplesCaptured
@@ -493,6 +505,8 @@ public enum CalibrationError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .deviceNotFound: return "Calibration device not found"
+        case .deviceNotDefaultOutput(let name):
+            return "The calibration tone plays through the system default output — set \"\(name)\" as the default output device in Sound settings, then run calibration again"
         case .permissionDenied: return "System audio capture permission was not granted"
         case .allocationFailed: return "Failed to allocate ring/context for calibration"
         case .noSamplesCaptured: return "No samples captured during calibration window"
