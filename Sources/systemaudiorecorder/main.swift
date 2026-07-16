@@ -114,15 +114,22 @@ func runRecord(_ parser: ArgParser) -> Never {
         maxSilenceStopSeconds = parsed
     }
 
-    let spec = SessionSpec(device: device)
+    var format: ExportFormat = .caf32
+    if let formatArg = parser.value("--format") {
+        guard let parsed = ExportFormat(rawValue: formatArg) else {
+            fail(.usage, "Invalid --format value: '\(formatArg)'. Expected one of: wav32, caf32.")
+        }
+        format = parsed
+    }
+
+    let spec = SessionSpec(device: device, format: format)
     let engine = CaptureEngine(recordingsRoot: recordingsRoot(from: parser))
 
     let startSemaphore = DispatchSemaphore(value: 0)
-    var sessionFolder: URL?
     var startError: Error?
     engine.start(spec: spec) { result in
         switch result {
-        case .success(let folder): sessionFolder = folder
+        case .success: break
         case .failure(let error): startError = error
         }
         startSemaphore.signal()
@@ -132,10 +139,7 @@ func runRecord(_ parser: ArgParser) -> Never {
     if let startError {
         fail(.captureError, "Failed to start recording: \(startError)")
     }
-    guard let sessionFolder else {
-        fail(.captureError, "Failed to start recording: unknown error")
-    }
-    stderrLine("[\(ManifestTimestamp.now())] Recording started: \(sessionFolder.path)")
+    stderrLine("[\(ManifestTimestamp.now())] Recording started...")
 
     var shouldStop = false
     let stopLock = NSLock()
@@ -210,20 +214,18 @@ func runRecord(_ parser: ArgParser) -> Never {
     }
 
     let stopSemaphore = DispatchSemaphore(value: 0)
-    engine.stop { _ in stopSemaphore.signal() }
+    var finalFileURL: URL?
+    engine.stop { url in
+        finalFileURL = url
+        stopSemaphore.signal()
+    }
     stopSemaphore.wait()
 
-    // SessionStore.writeManifest only logs failures internally; the only
-    // externally observable signal of a disk error at finalize time is the
-    // manifest never having been marked finalizedAt (Section 6.4).
-    let manifestURL = sessionFolder.appendingPathComponent("session.json")
-    if let data = try? Data(contentsOf: manifestURL),
-       let finalManifest = try? JSONDecoder().decode(SessionManifest.self, from: data),
-       finalManifest.session.finalizedAt == nil {
-        fail(.diskError, "Recording captured, but the session could not be finalized on disk (\(sessionFolder.path)). Check available disk space.")
+    guard let finalFileURL else {
+        fail(.diskError, "Recording captured, but the file could not be exported to disk. Check available disk space.")
     }
 
-    print(sessionFolder.path)
+    print(finalFileURL.path)
     exit(ExitCode.ok.rawValue)
 }
 
@@ -276,100 +278,7 @@ func runApps(_ parser: ArgParser) -> Never {
     exit(ExitCode.ok.rawValue)
 }
 
-func runSessions(_ parser: ArgParser) -> Never {
-    let json = parser.flag("--json")
-    let store = SessionStore(recordingsRoot: recordingsRoot(from: parser))
-    store.runCrashRecoveryScan()
-    let summaries = store.listSessions()
-    struct Row: Codable { let path: String; let date: String; let source: String; let hadDropouts: Bool; let hadGaps: Bool; let recovered: Bool }
-    let rows = summaries.map { s -> Row in
-        let events = s.manifest.lanes.flatMap { $0.events }
-        return Row(
-            path: s.folderURL.path,
-            date: s.manifest.session.createdAt,
-            source: s.manifest.session.sourceType,
-            hadDropouts: events.contains { $0.type == .zeroDropoutRebuild },
-            hadGaps: events.contains { $0.type == .overrunGap },
-            recovered: s.manifest.session.recovered ?? false
-        )
-    }
-    if json {
-        if let data = try? JSONEncoder().encode(rows), let str = String(data: data, encoding: .utf8) {
-            print(str)
-        }
-    } else {
-        for r in rows {
-            var badges: [String] = []
-            if r.recovered { badges.append("Recovered") }
-            if r.hadDropouts { badges.append("Had dropouts") }
-            if r.hadGaps { badges.append("Had gaps") }
-            let badgeStr = badges.isEmpty ? "" : " [\(badges.joined(separator: ", "))]"
-            print("\(r.date)\t\(r.source)\t\(r.path)\(badgeStr)")
-        }
-    }
-    exit(ExitCode.ok.rawValue)
-}
 
-// MARK: export
-
-func runExport(_ args: [String]) -> Never {
-    guard args.count >= 1 else {
-        fail(.usage, "usage: systemaudiorecorder export <session-path> --format flac16|flac24|alac16|alac24|aac|wav24 [--compensate-gain on|off] [--out <dir>]")
-    }
-    let sessionPath = args[0]
-    let parser = ArgParser(Array(args.dropFirst()))
-    guard let formatStr = parser.value("--format"), let format = ExportFormat(rawValue: formatStr) else {
-        fail(.usage, "Missing or invalid --format. Choose one of: \(ExportFormat.allCases.map(\.rawValue).joined(separator: ", "))")
-    }
-
-    let sessionFolder = URL(fileURLWithPath: sessionPath)
-    let store = SessionStore(recordingsRoot: sessionFolder.deletingLastPathComponent())
-    guard let manifest = try? store.readManifest(from: sessionFolder) else {
-        fail(.notFound, "Could not read session.json at \(sessionPath)")
-    }
-
-    let outDir = parser.value("--out").map { URL(fileURLWithPath: $0) } ?? sessionFolder.appendingPathComponent("exports")
-    try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-
-    let compensateFlag = parser.value("--compensate-gain")
-    if let compensateFlag, compensateFlag != "on", compensateFlag != "off" {
-        // Previously any string other than the exact literal "on" was
-        // silently treated as "off" — a typo or different casing (e.g.
-        // "On", "true") would silently skip gain compensation with no
-        // warning at all.
-        fail(.usage, "Invalid --compensate-gain value: '\(compensateFlag)'. Expected 'on' or 'off'.")
-    }
-
-    var anyFailure = false
-    for lane in manifest.lanes {
-        let hasProfile = lane.calibration != nil
-        let compensate = compensateFlag.map { $0 == "on" } ?? hasProfile
-        let gainDB = compensate ? lane.calibration?.gainCompensationDB : nil
-
-        for segment in lane.segments {
-            let masterURL = sessionFolder.appendingPathComponent(segment.file)
-            let ext: String
-            switch format {
-            case .flac16, .flac24: ext = "flac"
-            case .alac16, .alac24, .aac: ext = "m4a"
-            case .wav24: ext = "wav"
-            }
-            let destURL = outDir.appendingPathComponent(lane.slug).appendingPathComponent(masterURL.deletingPathExtension().lastPathComponent + ".\(ext)")
-            try? FileManager.default.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            do {
-                let result = try ExportService.export(masterURL: masterURL, to: destURL, format: format, gainCompensationDB: gainDB)
-                print(result.url.path)
-                if result.clippedSampleCount > 0 {
-                    stderrLine("Warning: \(result.clippedSampleCount) samples clipped in \(result.url.lastPathComponent)")
-                }
-            } catch {
-                stderrLine("Export failed for \(masterURL.path): \(error)")
-                anyFailure = true
-            }
-        }
-    }
-    exit(anyFailure ? ExitCode.captureError.rawValue : ExitCode.ok.rawValue)
-}
 
 // MARK: calibrate
 
@@ -418,7 +327,7 @@ func runCalibrate(_ parser: ArgParser) -> Never {
 
 let allArgs = Array(CommandLine.arguments.dropFirst())
 guard let verb = allArgs.first else {
-    fail(.usage, "usage: systemaudiorecorder <record|devices|apps|sessions|export|calibrate> [options]")
+    fail(.usage, "usage: systemaudiorecorder <record|devices|apps|calibrate> [options]")
 }
 let rest = Array(allArgs.dropFirst())
 let parser = ArgParser(rest)
@@ -427,9 +336,7 @@ switch verb {
 case "record": runRecord(parser)
 case "devices": runDevices(parser)
 case "apps": runApps(parser)
-case "sessions": runSessions(parser)
-case "export": runExport(rest)
 case "calibrate": runCalibrate(parser)
 default:
-    fail(.usage, "Unknown verb '\(verb)'. usage: systemaudiorecorder <record|devices|apps|sessions|export|calibrate> [options]")
+    fail(.usage, "Unknown verb '\(verb)'. usage: systemaudiorecorder <record|devices|apps|calibrate> [options]")
 }

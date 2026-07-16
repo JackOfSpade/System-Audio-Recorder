@@ -14,15 +14,17 @@ public final class SegmentWriter {
         public let index: Int
         public let asbd: AudioStreamBasicDescription
         public var framesWritten: Int64 = 0
-        fileprivate var file: ExtAudioFileRef
     }
 
-    private let laneDirectory: URL
-    private var nextIndex: Int = 1
     private(set) public var current: OpenSegment?
+    public private(set) var data = Data()
 
-    public init(laneDirectory: URL) {
-        self.laneDirectory = laneDirectory
+    /// The ASBD of the currently open segment, or nil if no segment is open.
+    public var asbd: AudioStreamBasicDescription? {
+        current?.asbd
+    }
+
+    public init() {
     }
 
     /// Builds the canonical ASBD (Section 6.2 table): Float32, interleaved,
@@ -42,84 +44,41 @@ public final class SegmentWriter {
         )
     }
 
-    /// Opens `segment-<NNN>.caf` (zero-padded to 3 digits, 1-based,
-    /// monotonically increasing per lane — Section 6.3) with the given ASBD
-    /// used for BOTH the file and client format.
+    /// Prepares the in-memory buffer.
     @discardableResult
     public func openNextSegment(asbd: AudioStreamBasicDescription) throws -> OpenSegment {
-        try FileManager.default.createDirectory(at: laneDirectory, withIntermediateDirectories: true)
-        let filename = String(format: "segment-%03d.caf", nextIndex)
-        let url = laneDirectory.appendingPathComponent(filename)
-
-        var fileASBD = asbd
-        var audioFile: ExtAudioFileRef?
-        let createStatus = ExtAudioFileCreateWithURL(
-            url as CFURL, kAudioFileCAFType, &fileASBD, nil, AudioFileFlags.eraseFile.rawValue, &audioFile
-        )
-        guard createStatus == noErr, let file = audioFile else {
-            throw CoreAudioError(status: createStatus, context: "ExtAudioFileCreateWithURL")
-        }
-
-        var clientASBD = asbd
-        let setStatus = ExtAudioFileSetProperty(
-            file, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &clientASBD
-        )
-        guard setStatus == noErr else {
-            ExtAudioFileDispose(file)
-            throw CoreAudioError(status: setStatus, context: "ExtAudioFileSetProperty(ClientDataFormat)")
-        }
-
-        let segment = OpenSegment(url: url, index: nextIndex, asbd: asbd, framesWritten: 0, file: file)
-        nextIndex += 1
+        let url = URL(fileURLWithPath: "/dummy/segment.caf")
+        let segment = OpenSegment(url: url, index: 1, asbd: asbd, framesWritten: 0)
         current = segment
+        data = Data()
         return segment
     }
 
-    /// Synchronous write of `frameCount` interleaved frames starting at
-    /// `bytes` (Section 5.4 step 6 / Section 6.2 "Write behavior").
+    /// Synchronous write of `frameCount` interleaved frames starting at `bytes`
+    /// into the in-memory buffer.
     public func write(bytes: UnsafeRawPointer, byteCount: Int, frameCount: UInt32, channels: UInt32) throws {
         guard var segment = current else { throw SegmentWriterError.noOpenSegment }
-
-        var bufferList = AudioBufferList(
-            mNumberBuffers: 1,
-            mBuffers: AudioBuffer(mNumberChannels: channels, mDataByteSize: UInt32(byteCount), mData: UnsafeMutableRawPointer(mutating: bytes))
-        )
-        let status = ExtAudioFileWrite(segment.file, frameCount, &bufferList)
-        guard status == noErr else {
-            throw CoreAudioError(status: status, context: "ExtAudioFileWrite")
-        }
+        data.append(UnsafeBufferPointer(start: bytes.assumingMemoryBound(to: UInt8.self), count: byteCount))
         segment.framesWritten += Int64(frameCount)
         current = segment
     }
 
     /// Result of `finalizeCurrentSegment()`: the frame count written, and
-    /// whether `ExtAudioFileDispose` actually succeeded in patching the
-    /// file's data-chunk size and frame count. `succeeded == false` means the
-    /// on-disk CAF header may still be in its unfinalized (zero/placeholder)
-    /// state — the caller must NOT mark the manifest segment `finalized:
-    /// true` in that case, or the crash-recovery scan (Section 6.5) will skip
-    /// a segment that actually still needs `CAFRecovery.patchUnfinalizedSegment`.
+    /// whether finalization succeeded.
     public struct FinalizeResult {
         public let frames: Int64
         public let succeeded: Bool
     }
 
-    /// Finalization (Section 6.2): flush + `ExtAudioFileDispose` (which
-    /// patches the real data-chunk size and frame count), returning the final
-    /// frame count for the caller to record in the manifest.
+    /// Finalization: returns the final frame count.
     @discardableResult
     public func finalizeCurrentSegment() -> FinalizeResult {
         guard let segment = current else {
             FileHandle.standardError.write("System Audio Recorder: finalizeCurrentSegment called with no open segment\n".data(using: .utf8)!)
             return FinalizeResult(frames: 0, succeeded: false)
         }
-        let status = ExtAudioFileDispose(segment.file)
         let frames = segment.framesWritten
         current = nil
-        if status != noErr {
-            FileHandle.standardError.write("System Audio Recorder: ExtAudioFileDispose failed with status \(status)\n".data(using: .utf8)!)
-            return FinalizeResult(frames: frames, succeeded: false)
-        }
         return FinalizeResult(frames: frames, succeeded: true)
     }
 

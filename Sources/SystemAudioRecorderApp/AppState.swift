@@ -26,14 +26,23 @@ final class AppState: ObservableObject {
     private var operationInFlight = false
 
     init() {
-        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/System Audio Recorder")
-        self.engine = CaptureEngine(recordingsRoot: root)
+        self.engine = CaptureEngine(recordingsRoot: AppState.resolvedRecordingsRoot())
         self.processCatalog = ProcessCatalog(engineQueue: DispatchQueue(label: "com.systemaudiorecorder.app.processcatalog"))
         engine.onStatusChanged = { [weak self] status in
             Task { @MainActor in self?.status = status }
         }
         engine.sessionStore.runCrashRecoveryScan()
         startMeterPolling()
+    }
+
+    /// Settings → General's "Recordings folder" field (`AppStorage` key
+    /// `recordingsFolder`) — read directly from `UserDefaults` since
+    /// `AppState` is a plain class, not a SwiftUI `View`, so it can't use the
+    /// `@AppStorage` property wrapper itself. Falls back to `~/Music/System
+    /// Audio Recorder/` if the setting was never touched.
+    private static func resolvedRecordingsRoot() -> URL {
+        let stored = UserDefaults.standard.string(forKey: "recordingsFolder") ?? "~/Music/System Audio Recorder/"
+        return URL(fileURLWithPath: (stored as NSString).expandingTildeInPath, isDirectory: true)
     }
 
     var isRecording: Bool {
@@ -67,7 +76,9 @@ final class AppState: ObservableObject {
     func start() {
         guard !operationInFlight else { return }
         operationInFlight = true
-        let spec = SessionSpec()
+        let storedFormat = UserDefaults.standard.string(forKey: "recordingFormat") ?? ExportFormat.caf32.rawValue
+        let format = ExportFormat(rawValue: storedFormat) ?? .caf32
+        let spec = SessionSpec(format: format)
         engine.start(spec: spec) { [weak self] result in
             Task { @MainActor in
                 guard let self else { return }
@@ -92,14 +103,14 @@ final class AppState: ObservableObject {
     func stop(completion: (() -> Void)? = nil) {
         guard !operationInFlight else { completion?(); return }
         operationInFlight = true
-        engine.stop { [weak self] folder in
+        engine.stop { [weak self] fileURL in
             Task { @MainActor in
                 guard let self else { completion?(); return }
                 self.operationInFlight = false
                 self.recordStartedAt = nil
                 self.elapsedSeconds = 0
-                if let folder {
-                    self.lastEventDescription = "Saved: \(folder.lastPathComponent)"
+                if let fileURL {
+                    self.lastEventDescription = "Saved: \(fileURL.lastPathComponent)"
                 }
                 completion?()
             }

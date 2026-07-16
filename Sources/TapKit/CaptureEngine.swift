@@ -1,27 +1,25 @@
+import AudioToolbox
 import CoreAudio
 import Foundation
 
 public enum EngineStatus: Sendable {
     case idle
-    case recording(sessionFolder: URL)
+    case recording
     case error(String)
 }
 
-/// Top-level orchestrator (Section 4.2). Accepts a `SessionSpec`, asks
-/// `SessionStore` to create the session folder + manifest, computes the lane
-/// plan (Section 4.6), creates and owns the `CaptureLane` instances, and
-/// runs the session lifecycle. Owns the **engine queue** — every Core Audio
+/// Top-level orchestrator (Section 4.2). Accepts a `SessionSpec`,
+/// computes the lane plan (Section 4.6), creates and owns the `CaptureLane` instances,
+/// and runs the session lifecycle. Owns the **engine queue** — every Core Audio
 /// hardware call in the process is serialized on it (Section 4.4).
 public final class CaptureEngine {
     private let engineQueue = DispatchQueue(label: "com.systemaudiorecorder.engine", qos: .userInitiated)
     public let sessionStore: SessionStore
 
     private var lanes: [CaptureLane] = []
-    // Each lane's `delegate` is `weak` (Section 4/8 callback contract), so
-    // these bridges need a real strong owner for the session's lifetime.
     private var laneDelegates: [ManifestUpdatingDelegate] = []
-    private var manifest: SessionManifest?
-    private var sessionFolder: URL?
+    private var currentSpec: SessionSpec?
+    private var currentNamingTemplate: String?
     private(set) public var status: EngineStatus = .idle
 
     public var onStatusChanged: ((EngineStatus) -> Void)?
@@ -33,15 +31,8 @@ public final class CaptureEngine {
 
     /// One entry per lane, in the SAME order as `watchdogStates()` — `nil`
     /// for a lane with no `drainLoop` yet (e.g. still preparing, or
-    /// currently `.waitingForDevice`). This used to `compactMap` out the
-    /// `nil`s, which silently shifted every later lane's snapshot into the
-    /// wrong position relative to `watchdogStates()`'s per-lane array
-    /// (which always keeps one entry per lane) — callers zipping the two
-    /// together by index would pair up the wrong lane's meter and watchdog
-    /// state whenever any earlier lane lacked a snapshot.
+    /// currently `.waitingForDevice`).
     public func meterSnapshots() -> [MeterSnapshot?] {
-        // Read-only, safe from any thread: each DrainLoop's MeterSnapshotBox
-        // is internally lock-guarded.
         lanes.map { $0.currentMeterSnapshot() }
     }
 
@@ -52,10 +43,7 @@ public final class CaptureEngine {
 
     /// Runs the TCC capture-permission probe (Section 9.4) serialized on the
     /// same engine queue as every other Core Audio hardware call (Section
-    /// 4.4). The probe itself calls AudioHardwareCreateProcessTap /
-    /// AudioHardwareDestroyProcessTap — running it on an unrelated
-    /// `DispatchQueue.global()` would let it race a lane's own tap
-    /// lifecycle calls on the HAL.
+    /// 4.4).
     public func requestCapturePermission(completion: @escaping (PermissionOutcome) -> Void) {
         engineQueue.async {
             let outcome = PermissionBroker.requestCapturePermission()
@@ -63,65 +51,45 @@ public final class CaptureEngine {
         }
     }
 
-    /// Starts a full session: creates the session folder + initial manifest,
-    /// then starts the single capture lane. If it fails to start, the
-    /// session is torn down and the error surfaced.
-    public func start(spec: SessionSpec, namingTemplate: String = "{date} {time} — {source}", completion: @escaping (Result<URL, Error>) -> Void) {
+    /// Runs `CalibrationService.recommendBufferFrameSize` on this engine's
+    /// own `engineQueue` (Section 4.4) rather than a caller-owned queue —
+    /// the temporary tap/aggregate/IOProc lifecycle calls it makes are
+    /// exactly the class of Core Audio HAL call that must never interleave
+    /// with a real session's `start`/`stop` on a second, independent queue.
+    public func recommendBufferFrameSize(completion: @escaping (Result<BufferCalibrationResult, Error>) -> Void) {
+        CalibrationService.recommendBufferFrameSize(engineQueue: engineQueue, completion: completion)
+    }
+
+    /// Starts a full session in memory. I/O buffer size is resolved by the
+    /// lane itself, per device, from `CalibrationService`'s shared
+    /// per-device store (Section 8.3; 512 if never calibrated) — the same
+    /// shared store both the GUI and the CLI write to and read from, so a
+    /// calibration run in either process is honored by both, and re-resolved
+    /// on every rebuild in case a device switch changes which store entry
+    /// applies (Section 7.3).
+    public func start(
+        spec: SessionSpec,
+        namingTemplate: String = "{date} {time} — {source}",
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         engineQueue.async { [weak self] in
             guard let self else { return }
             self.startOnEngineQueue(spec: spec, namingTemplate: namingTemplate, completion: completion)
         }
     }
 
-    private func startOnEngineQueue(spec: SessionSpec, namingTemplate: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        // Without this guard, calling start() again while a session is
-        // already recording would unconditionally overwrite `lanes`/
-        // `laneDelegates`/`manifest`/`sessionFolder` below — the previous
-        // session's `CaptureLane`s would simply be dropped, with nothing
-        // ever calling `.stop()` on them, orphaning their live Core Audio
-        // taps/aggregate devices/IOProcs and native ring/context memory
-        // (CaptureLane has no deinit safety net for this).
+    private func startOnEngineQueue(spec: SessionSpec, namingTemplate: String, completion: @escaping (Result<Void, Error>) -> Void) {
         guard lanes.isEmpty else {
             completion(.failure(CaptureEngineError.alreadyRecording))
             return
         }
-        let sourceLabel = "System Audio"
 
-        let deviceID = (try? resolveDeviceID(spec.device)) ?? (try? AudioDeviceDirectory.defaultOutputDevice())
-        let deviceUID = deviceID.flatMap { try? AudioDeviceDirectory.deviceUID($0) } ?? "unknown"
-        let deviceName = deviceID.flatMap { try? AudioDeviceDirectory.deviceName($0) } ?? "Unknown Device"
-        let rate = deviceID.flatMap { try? AudioDeviceDirectory.nominalSampleRate($0) } ?? 48000
+        self.currentSpec = spec
+        self.currentNamingTemplate = namingTemplate
 
-        let title = SessionStore.expand(
-            template: namingTemplate,
-            context: SessionStore.NamingContext(source: sourceLabel, app: sourceLabel, device: deviceName, rateHz: rate)
-        )
-
-        guard let folder = try? sessionStore.createSessionFolder(title: title) else {
-            completion(.failure(CaptureEngineError.couldNotCreateSessionFolder))
-            return
-        }
-        sessionStore.createLockFile(in: folder)
-        sessionFolder = folder
-
-        let sessionInfo = SessionInfo(
-            id: UUID().uuidString,
-            title: title,
-            createdAt: ManifestTimestamp.now(),
-            finalizedAt: nil,
-            recovered: false,
-            sourceType: "systemMix",
-            device: DeviceRef(uid: deviceUID, name: deviceName),
-            deviceHistory: [DeviceHistoryEntry(uid: deviceUID, name: deviceName, fromWallTime: ManifestTimestamp.now())],
-            timelinePolicy: spec.timelinePolicy.rawValue
-        )
-
-        // Always exactly one lane, slug "mix" — Section 4.6.
-        let laneDir = folder.appendingPathComponent("mix")
         let lane = CaptureLane(
             index: 0,
             slug: "mix",
-            laneDirectory: laneDir,
             spec: spec,
             engineQueue: engineQueue
         )
@@ -129,17 +97,6 @@ public final class CaptureEngine {
         lane.delegate = laneDelegate
         lanes = [lane]
         laneDelegates = [laneDelegate]
-        let laneEntries = [LaneEntry(
-            index: 0, slug: "mix",
-            processes: [], calibration: nil, segments: [], events: []
-        )]
-
-        let appInfo = AppInfo(name: "System Audio Recorder", version: "0.1.0", build: "1")
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
-        let osInfo = OSInfo(version: osVersion, build: "unknown")
-        let newManifest = SessionManifest(app: appInfo, os: osInfo, session: sessionInfo, lanes: laneEntries)
-        manifest = newManifest
-        sessionStore.writeManifest(newManifest, to: folder)
 
         let group = DispatchGroup()
         var firstError: Error?
@@ -155,33 +112,24 @@ public final class CaptureEngine {
         group.notify(queue: engineQueue) { [weak self] in
             guard let self else { return }
             if let firstError {
-                // Don't orphan lanes that DID start successfully just
-                // because a sibling lane failed — tear all of them down
-                // (live Core Audio hardware + a running DrainLoop thread per
-                // lane) before reporting the session as failed.
                 let stopGroup = DispatchGroup()
                 for lane in self.lanes {
                     stopGroup.enter()
                     lane.stop { stopGroup.leave() }
                 }
                 stopGroup.notify(queue: self.engineQueue) {
-                    // The graceful stop() path removes the lock file; this
-                    // failure path previously didn't, leaving `.recording.lock`
-                    // behind in a session folder that was never actually
-                    // recording — `SessionStore.isLive` would then hold it
-                    // "live" forever (its own PID, still running) even
-                    // though no lane in it ever started.
-                    self.sessionStore.removeLockFile(in: folder)
                     self.lanes = []
                     self.laneDelegates = []
+                    self.currentSpec = nil
+                    self.currentNamingTemplate = nil
                     self.status = .error("\(firstError)")
                     self.onStatusChanged?(self.status)
                     completion(.failure(firstError))
                 }
             } else {
-                self.status = .recording(sessionFolder: folder)
+                self.status = .recording
                 self.onStatusChanged?(self.status)
-                completion(.success(folder))
+                completion(.success(()))
             }
         }
     }
@@ -198,9 +146,7 @@ public final class CaptureEngine {
         }
     }
 
-    /// Graceful stop: every lane drains fully, finalizes its segments, then
-    /// session-level finalization writes `finalizedAt`, removes the lock
-    /// file, and fires `onSessionFinalize` — exactly once (Section 8.5/8.7).
+    /// Graceful stop: every lane drains fully, then exports the in-memory Float32 PCM directly to the target destination.
     public func stop(completion: @escaping (URL?) -> Void) {
         engineQueue.async { [weak self] in
             guard let self else { completion(nil); return }
@@ -210,46 +156,104 @@ public final class CaptureEngine {
                 lane.stop { group.leave() }
             }
             group.notify(queue: self.engineQueue) {
-                guard let folder = self.sessionFolder else { completion(nil); return }
-                // The caller (CLI/GUI) may exit or tear down immediately after
-                // `completion` fires, so `completion` must not run until the
-                // FINAL manifest write has actually landed on disk — writing
-                // fire-and-forget here previously let the process exit before
-                // `finalizedAt` (and each lane's finalized-segment update) was
-                // ever persisted, leaving a stale, unfinalized session.json.
-                guard var manifest = self.manifest else {
-                    self.finishStop(folder: folder, completion: completion)
+                guard let lane = self.lanes.first,
+                      let spec = self.currentSpec,
+                      let namingTemplate = self.currentNamingTemplate,
+                      let asbd = lane.effectiveASBD else {
+                    self.finishStop(fileURL: nil, completion: completion)
                     return
                 }
-                manifest.session.finalizedAt = ManifestTimestamp.now()
-                self.manifest = manifest
-                self.sessionStore.writeManifest(manifest, to: folder) {
-                    self.sessionStore.removeLockFile(in: folder)
-                    self.engineQueue.async {
-                        self.finishStop(folder: folder, completion: completion)
-                    }
+
+                let sourceLabel = "System Audio"
+                let deviceName = try? AudioDeviceDirectory.deviceName(try self.resolveDeviceID(spec.device))
+                let resolvedDeviceName = deviceName ?? "Unknown Device"
+
+                let title = SessionStore.expand(
+                    template: namingTemplate,
+                    context: SessionStore.NamingContext(source: sourceLabel, app: sourceLabel, device: resolvedDeviceName, rateHz: asbd.mSampleRate)
+                )
+                let sanitizedTitle = SessionStore.sanitize(title)
+
+                let ext: String
+                switch spec.format {
+                case .wav32: ext = "wav"
+                case .caf32: ext = "caf"
+                }
+
+                let filename = "\(sanitizedTitle).\(ext)"
+                let finalURL = self.sessionStore.recordingsRoot.appendingPathComponent(filename)
+
+                let tempURL = self.sessionStore.recordingsRoot.appendingPathComponent(".temp_capture_\(UUID().uuidString).caf")
+                do {
+                    try self.writeTemporaryCAF(url: tempURL, data: lane.recordedData, asbd: asbd)
+
+                    _ = try ExportService.export(
+                        masterURL: tempURL,
+                        to: finalURL,
+                        format: spec.format,
+                        gainCompensationDB: nil
+                    )
+
+                    try? FileManager.default.removeItem(at: tempURL)
+                    self.finishStop(fileURL: finalURL, completion: completion)
+                } catch {
+                    FileHandle.standardError.write("System Audio Recorder: failed to export: \(error)\n".data(using: .utf8)!)
+                    try? FileManager.default.removeItem(at: tempURL)
+                    self.finishStop(fileURL: nil, completion: completion)
                 }
             }
         }
     }
 
-    private func finishStop(folder: URL, completion: @escaping (URL?) -> Void) {
+    private func writeTemporaryCAF(url: URL, data: Data, asbd: AudioStreamBasicDescription) throws {
+        var fileASBD = asbd
+        var audioFile: ExtAudioFileRef?
+        let createStatus = ExtAudioFileCreateWithURL(
+            url as CFURL, kAudioFileCAFType, &fileASBD, nil, AudioFileFlags.eraseFile.rawValue, &audioFile
+        )
+        guard createStatus == noErr, let file = audioFile else {
+            throw CoreAudioError(status: createStatus, context: "ExtAudioFileCreateWithURL")
+        }
+        defer { ExtAudioFileDispose(file) }
+
+        var clientASBD = asbd
+        let setStatus = ExtAudioFileSetProperty(
+            file, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &clientASBD
+        )
+        guard setStatus == noErr else {
+            throw CoreAudioError(status: setStatus, context: "ExtAudioFileSetProperty(ClientDataFormat)")
+        }
+
+        let status = data.withUnsafeBytes { raw -> OSStatus in
+            var bufferList = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: asbd.mChannelsPerFrame,
+                    mDataByteSize: UInt32(raw.count),
+                    mData: UnsafeMutableRawPointer(mutating: raw.baseAddress)
+                )
+            )
+            let frameCount = UInt32(raw.count) / asbd.mBytesPerFrame
+            return ExtAudioFileWrite(file, frameCount, &bufferList)
+        }
+        guard status == noErr else {
+            throw CoreAudioError(status: status, context: "ExtAudioFileWrite")
+        }
+    }
+
+    private func finishStop(fileURL: URL?, completion: @escaping (URL?) -> Void) {
         self.lanes = []
         self.laneDelegates = []
+        self.currentSpec = nil
+        self.currentNamingTemplate = nil
         self.status = .idle
         self.onStatusChanged?(.idle)
-        completion(folder)
+        completion(fileURL)
     }
 
     // MARK: Manifest mutation from lane callbacks (engine queue only)
 
     fileprivate func updateManifest(_ mutate: @escaping (inout SessionManifest) -> Void) {
-        engineQueue.async { [weak self] in
-            guard let self, var manifest = self.manifest, let folder = self.sessionFolder else { return }
-            mutate(&manifest)
-            self.manifest = manifest
-            self.sessionStore.writeManifest(manifest, to: folder)
-        }
     }
 
     /// Section 7.5 step 4: a `.fixed`-device lane gave up waiting for its

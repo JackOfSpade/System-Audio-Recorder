@@ -11,17 +11,20 @@ public struct SessionSpec: Sendable {
     public var device: DevicePolicy
     public var muteBehavior: MuteBehavior
     public var timelinePolicy: TimelinePolicy
+    public var format: ExportFormat
 
     public init(
         excludeBundleIDs: [String] = [],
         device: DevicePolicy = .followSystemDefault,
         muteBehavior: MuteBehavior = .unmuted,
-        timelinePolicy: TimelinePolicy = .preserveWallClock
+        timelinePolicy: TimelinePolicy = .preserveWallClock,
+        format: ExportFormat = .caf32
     ) {
         self.excludeBundleIDs = excludeBundleIDs
         self.device = device
         self.muteBehavior = muteBehavior
         self.timelinePolicy = timelinePolicy
+        self.format = format
     }
 }
 

@@ -173,6 +173,44 @@ public enum AudioDeviceDirectory {
         try CAProp.setFixed(deviceID, kAudioDevicePropertyBufferFrameSize, value: frames, context: "setBufferFrameSize")
     }
 
+    /// The device's actual supported I/O buffer size range
+    /// (`kAudioDevicePropertyBufferFrameSizeRange`) — the hardware/driver's
+    /// real floor and ceiling. This is the absolute lower bound calibration
+    /// can never go below, no matter how fast the host machine is.
+    public static func bufferFrameSizeRange(_ deviceID: AudioObjectID) throws -> ClosedRange<UInt32> {
+        let range = try CAProp.readFixed(
+            deviceID, kAudioDevicePropertyBufferFrameSizeRange, as: AudioValueRange.self, context: "bufferFrameSizeRange"
+        )
+        // Driver-reported values are untrusted input: NaN/infinite/negative/
+        // beyond-UInt32.max must degrade to a safe bound, never trap — an
+        // unchecked `UInt32(_:)` conversion aborts the process on any of those.
+        func safeFrames(_ value: Double, fallback: UInt32) -> UInt32 {
+            guard value.isFinite else { return fallback }
+            let rounded = value.rounded()
+            guard rounded >= 1 else { return 1 }
+            guard rounded <= Double(UInt32.max) else { return UInt32.max }
+            return UInt32(rounded)
+        }
+        let minimum = safeFrames(range.mMinimum, fallback: 1)
+        let maximum = max(minimum, safeFrames(range.mMaximum, fallback: minimum))
+        return minimum...maximum
+    }
+
+    /// Resolves a `DevicePolicy` to the `AudioObjectID` it currently names —
+    /// the exact rule `TapFactory.create` step 1 and
+    /// `CalibrationService.effectiveBufferFrameSize` both need to agree on.
+    public static func resolveDevice(for policy: DevicePolicy) throws -> AudioObjectID {
+        switch policy {
+        case .followSystemDefault:
+            return try defaultOutputDevice()
+        case .fixed(let uid):
+            guard let found = try findDevice(byUID: uid) else {
+                throw TapFactoryError.deviceNotFound(uid: uid)
+            }
+            return found
+        }
+    }
+
     public static func findDevice(byUID uid: String) throws -> AudioObjectID? {
         for id in try allDevices() {
             if let existingUID = try? deviceUID(id), existingUID == uid {

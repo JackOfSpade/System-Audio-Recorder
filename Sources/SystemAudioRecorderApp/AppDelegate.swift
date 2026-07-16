@@ -8,7 +8,6 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
-    private var libraryWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     private let hotkeyCenter = HotkeyCenter()
@@ -60,7 +59,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pop.behavior = .transient
         pop.contentViewController = NSHostingController(rootView: MenuBarView(
             appState: appState,
-            openLibrary: { [weak self] in self?.showLibrary() },
             openSettings: { [weak self] in self?.showSettings() },
             quit: { NSApp.terminate(nil) }
         ))
@@ -96,31 +94,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    private func showLibrary() {
-        if libraryWindow == nil {
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 800, height: 500),
-                styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                backing: .buffered, defer: false
-            )
-            window.title = "System Audio Recorder Library"
-            window.contentViewController = NSHostingController(rootView: LibraryView(appState: appState))
-            window.isReleasedWhenClosed = false
-            libraryWindow = window
-        }
-        libraryWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
     private func showSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+                contentRect: NSRect(x: 0, y: 0, width: 620, height: 380),
                 styleMask: [.titled, .closable, .miniaturizable],
                 backing: .buffered, defer: false
             )
             window.title = "System Audio Recorder Settings"
-            window.contentViewController = NSHostingController(rootView: SettingsView(appState: appState))
+            window.contentViewController = NSHostingController(rootView: SettingsView(
+                appState: appState,
+                keepSettingsVisible: { [weak self] in
+                    self?.settingsWindow?.orderFrontRegardless()
+                },
+                pinSettingsVisible: { [weak self] pinned in
+                    guard let window = self?.settingsWindow else { return }
+                    window.hidesOnDeactivate = false
+                    window.level = pinned ? .floating : .normal
+                    window.orderFrontRegardless()
+                }
+            ))
             window.isReleasedWhenClosed = false
             settingsWindow = window
         }

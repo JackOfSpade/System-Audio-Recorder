@@ -28,19 +28,13 @@ public enum TapFactory {
         spec: SessionSpec,
         laneSlug: String,
         excludeProcessIDs: [AudioObjectID],
-        bufferFrameSize: UInt32
+        bufferFrameSize: UInt32,
+        resolvedDeviceID: AudioObjectID? = nil
     ) throws -> TapHandle {
-        // Step 1: resolve the target device.
-        let deviceID: AudioObjectID
-        switch spec.device {
-        case .followSystemDefault:
-            deviceID = try AudioDeviceDirectory.defaultOutputDevice()
-        case .fixed(let uid):
-            guard let found = try AudioDeviceDirectory.findDevice(byUID: uid) else {
-                throw TapFactoryError.deviceNotFound(uid: uid)
-            }
-            deviceID = found
-        }
+        // Step 1: resolve the target device (skip if the caller already
+        // did — e.g. CaptureLane resolves once and reuses it for both the
+        // calibration lookup and this call, rather than resolving twice).
+        let deviceID = try resolvedDeviceID ?? AudioDeviceDirectory.resolveDevice(for: spec.device)
         let deviceUID = try AudioDeviceDirectory.deviceUID(deviceID)
         let nominalRate = try AudioDeviceDirectory.nominalSampleRate(deviceID)
         let channelCount = (try? AudioDeviceDirectory.outputChannelCount(deviceID)) ?? 2

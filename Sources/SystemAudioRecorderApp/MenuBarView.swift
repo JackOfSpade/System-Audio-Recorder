@@ -6,7 +6,6 @@ import TapKit
 /// Library/Settings/Quit items.
 struct MenuBarView: View {
     @ObservedObject var appState: AppState
-    var openLibrary: () -> Void
     var openSettings: () -> Void
     var quit: () -> Void
 
@@ -53,8 +52,7 @@ struct MenuBarView: View {
 
             Divider()
 
-            Button("Open Library…", action: openLibrary)
-            Button("Settings…", action: openSettings)
+            Button("Settings", action: openSettings)
             Divider()
             Button("Quit System Audio Recorder") { quit() }
                 .disabled(appState.isRecording)

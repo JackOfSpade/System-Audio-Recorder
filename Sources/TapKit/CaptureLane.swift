@@ -33,12 +33,17 @@ public protocol CaptureLaneDelegate: AnyObject {
 public final class CaptureLane {
     public let index: Int
     public let slug: String
-    public let laneDirectory: URL
     public weak var delegate: CaptureLaneDelegate?
+
+    public var recordedData: Data {
+        segmentWriter.data
+    }
+    public var effectiveASBD: AudioStreamBasicDescription? {
+        segmentWriter.asbd
+    }
 
     private let engineQueue: DispatchQueue
     private let spec: SessionSpec
-    private let bufferFrameSize: UInt32
     private let ownPID: pid_t
 
     public private(set) var state: LaneState = .idle {
@@ -89,19 +94,15 @@ public final class CaptureLane {
     public init(
         index: Int,
         slug: String,
-        laneDirectory: URL,
         spec: SessionSpec,
-        engineQueue: DispatchQueue,
-        bufferFrameSize: UInt32 = 512
+        engineQueue: DispatchQueue
     ) {
         self.index = index
         self.slug = slug
-        self.laneDirectory = laneDirectory
         self.spec = spec
         self.engineQueue = engineQueue
-        self.bufferFrameSize = bufferFrameSize
         self.ownPID = ProcessInfo.processInfo.processIdentifier
-        self.segmentWriter = SegmentWriter(laneDirectory: laneDirectory)
+        self.segmentWriter = SegmentWriter()
         self.watchdog = ZeroWatchdog()
         self.watchdog.delegate = watchdogBridge
         startCorroborationPolling()
@@ -174,11 +175,17 @@ public final class CaptureLane {
     private func buildAndRun(reuseExistingSegment: Bool) throws {
         let excludeIDs = resolveExcludeProcessObjectIDs()
 
-        let handle = try TapFactory.create(
-            spec: spec,
-            laneSlug: slug,
-            excludeProcessIDs: excludeIDs,
-            bufferFrameSize: bufferFrameSize
+        // Resolved once per call (initial build AND every rebuild) and
+        // reused below for both the calibration lookup and TapFactory.create
+        // — never cached across the lane's lifetime (a `.followSystemDefault`
+        // rebuild can land on a physically different device, Section 7.3),
+        // and never re-resolved a second time within one call (which could
+        // in principle answer differently if the OS flips the default
+        // output device in the interim).
+        let deviceID = try AudioDeviceDirectory.resolveDevice(for: spec.device)
+        let requestedBufferFrameSize = CalibrationService.effectiveBufferFrameSize(forResolvedDevice: deviceID)
+        let (handle, bufferFrameSize) = try buildTapHandle(
+            excludeIDs: excludeIDs, deviceID: deviceID, requestedBufferFrameSize: requestedBufferFrameSize
         )
         tapHandle = handle
 
@@ -228,6 +235,46 @@ public final class CaptureLane {
         loop.start()
 
         startObservingDeviceForThisLane(handle: handle)
+    }
+
+    /// Builds the tap+aggregate at `requestedBufferFrameSize` against the
+    /// already-resolved `deviceID`. If — and only if — the device rejects
+    /// that exact value at the buffer-size property write itself (a stale
+    /// calibration entry: the device's real range narrowed since
+    /// calibration ran, e.g. a sample-rate renegotiation, or a rebuild that
+    /// landed on a different physical device than the one calibration
+    /// measured), retries once, clamped into that device's own *live*
+    /// `kAudioDevicePropertyBufferFrameSizeRange`, rather than letting a
+    /// fixable buffer-size mismatch abandon the whole recording. Any other
+    /// failure (permission, tap/aggregate creation) is NOT buffer-size
+    /// related and must propagate unmodified, not trigger a pointless
+    /// second attempt. A clamped retry is only ever used for this one
+    /// session — it is deliberately NOT persisted back to the shared
+    /// calibration store: a successful `AudioObjectSetPropertyData` is
+    /// weaker evidence than `recommendBufferFrameSize`'s real probe, which
+    /// also registers and starts an IOProc before trusting a candidate.
+    private func buildTapHandle(
+        excludeIDs: [AudioObjectID], deviceID: AudioObjectID, requestedBufferFrameSize: UInt32
+    ) throws -> (TapHandle, UInt32) {
+        do {
+            let handle = try TapFactory.create(
+                spec: spec, laneSlug: slug, excludeProcessIDs: excludeIDs,
+                bufferFrameSize: requestedBufferFrameSize, resolvedDeviceID: deviceID
+            )
+            return (handle, requestedBufferFrameSize)
+        } catch {
+            guard (error as? CoreAudioError)?.context == "setBufferFrameSize",
+                  let liveRange = try? AudioDeviceDirectory.bufferFrameSizeRange(deviceID) else {
+                throw error
+            }
+            let clamped = min(max(requestedBufferFrameSize, liveRange.lowerBound), liveRange.upperBound)
+            guard clamped != requestedBufferFrameSize else { throw error }
+            let handle = try TapFactory.create(
+                spec: spec, laneSlug: slug, excludeProcessIDs: excludeIDs,
+                bufferFrameSize: clamped, resolvedDeviceID: deviceID
+            )
+            return (handle, clamped)
+        }
     }
 
     private static func ringCapacityBytes(sampleRate: Float64, channels: Int) -> Int {
