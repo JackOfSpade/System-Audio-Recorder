@@ -7,7 +7,7 @@
  * destroy/arm_first_host_time allocate, and those run on the engine queue,
  * never on the IOProc thread.
  *
- * Threading contract (see Section 5 of DESIGN.md):
+ * Threading contract:
  *   - td_context_on_io / td_context_on_io_planar: IOProc thread ONLY (producer).
  *   - td_ring_available_frames / td_ring_read / td_ring_take_dropped_deltas /
  *     td_context_read_timestamps: DrainLoop thread ONLY (consumer).

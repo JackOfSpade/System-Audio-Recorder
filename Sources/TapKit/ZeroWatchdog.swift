@@ -1,6 +1,6 @@
 import Foundation
 
-/// Bug-B all-zero dropout detector + rebuild executor (DESIGN.md Section 8.1).
+/// Bug-B all-zero dropout detector + rebuild executor.
 /// Zero-run accounting and corroboration reporting normally happen from the
 /// lane's `DrainLoop` thread, but `rebuildCompleted(success:)` is called from
 /// the engine queue (by `CaptureLane`, after a teardown+rebuild finishes) —

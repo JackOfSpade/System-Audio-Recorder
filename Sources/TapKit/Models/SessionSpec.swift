@@ -1,7 +1,7 @@
 import Foundation
 import CoreAudio
 
-/// A recording is fully described by a `SessionSpec` (DESIGN.md Section 3.4–3.5).
+/// A recording is fully described by a `SessionSpec`.
 /// `CaptureEngine` consumes this to build the single capture lane.
 public struct SessionSpec: Sendable {
     /// Bundle ids excluded from the global system-mix tap. System Audio Recorder's own PID
