@@ -1,0 +1,41 @@
+name: Merge validated PR
+
+# Explicit selection replaces automatic sweeping/merging/deletion of branches.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Same-repository PR to merge after all required checks pass'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-validated-pr
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Check out trusted main policy, never PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Merge only the selected validated PR and check main
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REQUIRED_CHECKS: '["CI required", "Security required", "Dependency review required"]'
+          MAIN_WORKFLOWS: '["ci.yml", "codeql.yml"]'
+        run: python3 .github/scripts/merge_validated_pr.py
