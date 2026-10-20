@@ -32,6 +32,7 @@ jobs:
           ref: main
           persist-credentials: false
       - name: Merge only the selected validated PR and check main
+        id: merge
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}

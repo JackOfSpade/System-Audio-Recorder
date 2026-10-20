@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import pathlib
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -78,6 +79,7 @@ class MergePolicyTests(unittest.TestCase):
             if path.endswith('/pulls/7'):
                 result = copy.deepcopy(self.pr)
                 result['merged'] = bool(calls)
+                result['merge_commit_sha'] = 'merged'
                 return result
             if path.endswith('/git/ref/heads/main'):
                 return {'object': {'sha': 'base'}}
@@ -89,9 +91,13 @@ class MergePolicyTests(unittest.TestCase):
         env = {'GITHUB_REPOSITORY': 'owner/repo', 'PR_NUMBER': '7',
                'REQUIRED_CHECKS': '["CI required"]',
                'MAIN_WORKFLOWS': '["ci.yml", "codeql.yml"]'}
-        with patch.dict(policy.os.environ, env), patch.object(policy, 'api', api), \
-                patch.object(policy, 'gh', lambda *args: calls.append(args)):
-            policy.main()
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / 'output'
+            env['GITHUB_OUTPUT'] = str(output)
+            with patch.dict(policy.os.environ, env, clear=True), patch.object(policy, 'api', api), \
+                    patch.object(policy, 'gh', lambda *args: calls.append(args)):
+                policy.main()
+            self.assertEqual(output.read_text(), 'base_sha=base\nhead_sha=head\nmerge_sha=merged\n')
         self.assertEqual(calls, [
             ('pr', 'merge', '7', '--repo', 'owner/repo', '--merge', '--match-head-commit', 'head'),
             ('workflow', 'run', 'ci.yml', '--repo', 'owner/repo', '--ref', 'main'),

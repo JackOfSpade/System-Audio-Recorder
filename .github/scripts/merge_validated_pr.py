@@ -68,6 +68,14 @@ def main():
     merged = api(f"repos/{repo}/pulls/{int(number)}")
     if not merged.get("merged"):
         raise RuntimeError("GitHub did not confirm the selected PR was merged")
+    if os.environ.get("GITHUB_OUTPUT"):
+        outputs = {"base_sha": base, "head_sha": head,
+                   "merge_sha": merged["merge_commit_sha"]}
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            for key, value in outputs.items():
+                if not isinstance(value, str) or not value.isalnum():
+                    raise ValueError("Invalid commit identifier from GitHub")
+                output.write(f"{key}={value}\n")
     for workflow in json.loads(os.environ["MAIN_WORKFLOWS"]):
         gh("workflow", "run", workflow, "--repo", repo, "--ref", "main")
     print(f"Merged PR #{int(number)} and dispatched main validation")
