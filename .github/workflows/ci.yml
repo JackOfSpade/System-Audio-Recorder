@@ -47,18 +47,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require every validation job to succeed
+      - name: Require every prerequisite to succeed
         env:
-          RESULTS: ${{ toJSON(needs) }}
+          JOB_RESULTS: ${{ toJSON(needs) }}
         run: |
           python3 - <<'PY'
-          import json, os
-          results = json.loads(os.environ["RESULTS"])
-          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          import json, os, sys
+          results = json.loads(os.environ["JOB_RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
           if failed:
-              raise SystemExit(f"Required jobs did not succeed: {failed}")
+              sys.exit("Unsuccessful prerequisites: " + ", ".join(failed))
           PY
-
   merge-policy:
     name: Validate merge policy
     runs-on: ubuntu-latest

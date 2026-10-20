@@ -2,6 +2,7 @@ import copy
 import importlib.util
 import pathlib
 import unittest
+from unittest.mock import patch
 
 PATH = pathlib.Path(__file__).parents[1] / "scripts" / "merge_validated_pr.py"
 if not PATH.exists():
@@ -70,6 +71,31 @@ class MergePolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.validate(self.pr, "base", self.comparison, self.checks,
                             ["CI required", "Security required"])
+
+    def test_merge_targets_one_exact_head_then_dispatches_main_validation(self):
+        calls = []
+        def api(path, paginated=False):
+            if path.endswith('/pulls/7'):
+                result = copy.deepcopy(self.pr)
+                result['merged'] = bool(calls)
+                return result
+            if path.endswith('/git/ref/heads/main'):
+                return {'object': {'sha': 'base'}}
+            if '/compare/' in path:
+                return self.comparison
+            if '/check-runs?' in path:
+                return [{'check_runs': self.checks}]
+            raise AssertionError(path)
+        env = {'GITHUB_REPOSITORY': 'owner/repo', 'PR_NUMBER': '7',
+               'REQUIRED_CHECKS': '["CI required"]',
+               'MAIN_WORKFLOWS': '["ci.yml", "codeql.yml"]'}
+        with patch.dict(policy.os.environ, env), patch.object(policy, 'api', api), \
+                patch.object(policy, 'gh', lambda *args: calls.append(args)):
+            policy.main()
+        self.assertEqual(calls, [
+            ('pr', 'merge', '7', '--repo', 'owner/repo', '--merge', '--match-head-commit', 'head'),
+            ('workflow', 'run', 'ci.yml', '--repo', 'owner/repo', '--ref', 'main'),
+            ('workflow', 'run', 'codeql.yml', '--repo', 'owner/repo', '--ref', 'main')])
 
 
 if __name__ == "__main__":
