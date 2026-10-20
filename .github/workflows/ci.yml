@@ -43,7 +43,7 @@ jobs:
   required:
     name: CI required
     if: ${{ always() }}
-    needs: [test]
+    needs: ["test", "merge-policy"]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -58,3 +58,11 @@ jobs:
           if failed:
               raise SystemExit(f"Required jobs did not succeed: {failed}")
           PY
+
+  merge-policy:
+    name: Validate merge policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 -m unittest discover -s .github/tests -p 'test_merge_validated_pr.py'
